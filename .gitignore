@@ -1,0 +1,16 @@
+certificates/
+client-certificates/
+node_modules/
+agent.db
+server.db
+*config.json*
+config.json
+*.log
+*.log.*
+.vscode
+.DS_Store
+dist/
+coverage/
+.env
+.ssl_server_token
+!pkg.config.json

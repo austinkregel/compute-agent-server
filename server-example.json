@@ -1,0 +1,21 @@
+{
+  "port": 8443,
+  "authToken": "your.auth.token",
+  "dbFile": "server.db",
+  "logFile": "server.log",
+  "pingIntervalSec": 30,
+  "pongTimeoutSec": 90,
+  "github_user": "your.github.user",
+  "versionReleaseWebhookSecret": "some_random_secret",
+  "serverUrl": "https://your.server.url",
+  "oidc": {
+    "baseURL": "https://your.oidc.base.url",
+    "enabled": true,
+    "issuer": "https://your.oidc.issuer",
+    "clientId": "your.oidc.client.id",
+    "clientSecret": "your.oidc.client.secret",
+    "redirectUri": "https://your.oidc.redirect.uri",
+    "scopes": ["openid"],
+    "idTokenSigningAlg": "RS256"
+  }
+}
