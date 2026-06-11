@@ -284,6 +284,7 @@ func (s *Server) buildHandler() http.Handler {
 	// OIDC auth routes
 	if s.oidc != nil {
 		mux.Get("/auth/login", s.oidc.HandleLogin)
+		mux.Get("/auth/app", s.oidc.HandleAppLogin)
 		mux.Get("/auth/callback", s.oidc.HandleCallback)
 		mux.Get("/auth/logout", s.oidc.HandleLogout)
 		// Legacy /login redirect

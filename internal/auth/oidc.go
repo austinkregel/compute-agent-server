@@ -11,6 +11,7 @@ import (
 	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -25,11 +26,19 @@ import (
 )
 
 const (
-	sessionCookieName = "session"
-	stateCookieName   = "oidc_state"
-	pkceCookieName    = "oidc_pkce"
-	sessionMaxAge     = 24 * time.Hour
+	sessionCookieName     = "session"
+	stateCookieName       = "oidc_state"
+	pkceCookieName        = "oidc_pkce"
+	appRedirectCookieName = "app_redirect"
+	sessionMaxAge         = 24 * time.Hour
 )
+
+// allowedAppRedirects is the closed set of custom-scheme redirect targets the
+// desktop app may receive a token at. Restricting this prevents an open
+// redirect that would exfiltrate the access token to an attacker-chosen URL.
+var allowedAppRedirects = map[string]bool{
+	"rebase://callback": true,
+}
 
 // SessionUser holds the user claims extracted from an OIDC session.
 type SessionUser struct {
@@ -160,6 +169,30 @@ func (p *OIDCProvider) HandleLogin(w http.ResponseWriter, r *http.Request) {
 	http.Redirect(w, r, url, http.StatusFound)
 }
 
+// HandleAppLogin begins the OIDC flow on behalf of the desktop app. After
+// authentication, HandleCallback redirects the access token to the app's
+// custom-scheme `redirect` (validated against allowedAppRedirects) instead of
+// the dashboard. The app receives it via its rebase:// deep-link handler.
+func (p *OIDCProvider) HandleAppLogin(w http.ResponseWriter, r *http.Request) {
+	redirect := r.URL.Query().Get("redirect")
+	if !allowedAppRedirects[redirect] {
+		http.Error(w, "invalid redirect", http.StatusBadRequest)
+		return
+	}
+	secure := strings.HasPrefix(p.cfg.BaseURL, "https://")
+	http.SetCookie(w, &http.Cookie{
+		Name:     appRedirectCookieName,
+		Value:    redirect,
+		Path:     "/",
+		MaxAge:   300,
+		HttpOnly: true,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
+	// Reuse the standard PKCE/state setup + provider redirect.
+	p.HandleLogin(w, r)
+}
+
 // HandleCallback handles the OIDC callback, exchanges the code for tokens,
 // creates a session, and redirects to the dashboard.
 func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
@@ -267,6 +300,15 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 	secure := strings.HasPrefix(p.cfg.BaseURL, "https://")
 	clearCookie(w, stateCookieName, secure)
 	clearCookie(w, pkceCookieName, secure)
+
+	// Desktop-app sign-in: hand the access token back to the app via its
+	// custom-scheme redirect (validated when it was set) instead of the dashboard.
+	if c, err := r.Cookie(appRedirectCookieName); err == nil && allowedAppRedirects[c.Value] {
+		clearCookie(w, appRedirectCookieName, secure)
+		dest := c.Value + "?token=" + url.QueryEscape(token.AccessToken)
+		http.Redirect(w, r, dest, http.StatusFound)
+		return
+	}
 
 	// Redirect to dashboard
 	http.Redirect(w, r, "/", http.StatusFound)
@@ -684,6 +726,7 @@ const jwtErrorPageHTML = `<!DOCTYPE html>
 func (p *OIDCProvider) Routes() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/auth/login", p.HandleLogin)
+	mux.HandleFunc("/auth/app", p.HandleAppLogin)
 	mux.HandleFunc("/auth/callback", p.HandleCallback)
 	mux.HandleFunc("/auth/logout", p.HandleLogout)
 	return mux
