@@ -554,6 +554,125 @@ func TestFilePutResult_RoutedToOwner(t *testing.T) {
 	}
 }
 
+func TestFileGetRequest_CreatesOp(t *testing.T) {
+	r, _, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_get_request", map[string]any{
+		"clientId": "node-1", "path": "/tmp/read.txt",
+	}))
+
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	var op *fileOp
+	for _, o := range r.fileOps {
+		op = o
+	}
+	r.fileMu.RUnlock()
+
+	if count != 1 {
+		t.Fatalf("file ops = %d, want 1", count)
+	}
+	if op.Type != "get" {
+		t.Errorf("type = %q, want get", op.Type)
+	}
+	if op.DashConnID != "dash-1" {
+		t.Errorf("dashConnID = %q", op.DashConnID)
+	}
+}
+
+func TestFileGetRequest_ClientOffline(t *testing.T) {
+	r, md, _ := testRelay(t)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_get_request", map[string]any{
+		"clientId": "ghost", "path": "/tmp/read.txt", "requestId": "req-1",
+	}))
+
+	msg := md.findSent("dash-1", "file_get_result")
+	if msg == nil {
+		t.Fatal("file_get_result (offline) not sent to dash-1")
+	}
+	if msg.Data["ok"] != false {
+		t.Errorf("ok = %v, want false", msg.Data["ok"])
+	}
+
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if count != 0 {
+		t.Errorf("file ops = %d, want 0 (client offline)", count)
+	}
+}
+
+func TestFileGetChunkAndResult_RoutedToOwner(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_get_request", map[string]any{
+		"clientId": "node-1", "path": "/tmp/read.txt",
+	}))
+
+	r.fileMu.RLock()
+	var reqID string
+	for id := range r.fileOps {
+		reqID = id
+	}
+	r.fileMu.RUnlock()
+
+	// Streamed chunk routes back to the requesting dashboard, op stays open.
+	r.HandleAgentEvent("node-1", makeMsg("file_get_chunk", map[string]any{
+		"requestId": reqID, "offset": float64(0), "data": "aGVsbG8=",
+	}))
+	chunk := md.findSent("dash-1", "file_get_chunk")
+	if chunk == nil {
+		t.Fatal("file_get_chunk not routed to dash-1")
+	}
+	if chunk.Data["data"] != "aGVsbG8=" {
+		t.Errorf("chunk data = %v", chunk.Data["data"])
+	}
+	r.fileMu.RLock()
+	stillOpen := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if stillOpen != 1 {
+		t.Errorf("file ops = %d after chunk, want 1 (still streaming)", stillOpen)
+	}
+
+	// Terminal result routes back and clears the op.
+	r.HandleAgentEvent("node-1", makeMsg("file_get_result", map[string]any{
+		"requestId": reqID, "ok": true, "path": "/tmp/read.txt", "size": float64(5),
+	}))
+	result := md.findSent("dash-1", "file_get_result")
+	if result == nil {
+		t.Fatal("file_get_result not routed to dash-1")
+	}
+	if result.Data["ok"] != true {
+		t.Errorf("ok = %v, want true", result.Data["ok"])
+	}
+
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if count != 0 {
+		t.Errorf("file ops = %d after result, want 0", count)
+	}
+}
+
+func TestFileGetChunk_UnknownRequestIgnored(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+
+	// A chunk for a requestId with no registered op must be dropped silently.
+	r.HandleAgentEvent("node-1", makeMsg("file_get_chunk", map[string]any{
+		"requestId": "nope", "offset": float64(0), "data": "eA==",
+	}))
+	if msg := md.findSent("dash-1", "file_get_chunk"); msg != nil {
+		t.Error("orphan file_get_chunk should not be routed anywhere")
+	}
+}
+
 func TestFileDeleteRequest(t *testing.T) {
 	r, _, store := testRelay(t)
 	store.AddClient("node-1", nil)

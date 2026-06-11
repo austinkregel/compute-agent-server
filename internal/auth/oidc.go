@@ -303,15 +303,35 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Desktop-app sign-in: hand the access token back to the app via its
 	// custom-scheme redirect (validated when it was set) instead of the dashboard.
+	// An interstitial page (rather than a raw 302 to a custom scheme, which
+	// browsers handle inconsistently) auto-opens the app and offers a manual
+	// fallback, so the handoff is visible and doesn't bounce to the prior page.
 	if c, err := r.Cookie(appRedirectCookieName); err == nil && allowedAppRedirects[c.Value] {
 		clearCookie(w, appRedirectCookieName, secure)
 		dest := c.Value + "?token=" + url.QueryEscape(token.AccessToken)
-		http.Redirect(w, r, dest, http.StatusFound)
+		p.renderAppHandoff(w, dest)
 		return
 	}
 
 	// Redirect to dashboard
 	http.Redirect(w, r, "/", http.StatusFound)
+}
+
+// renderAppHandoff returns a page that opens the desktop app at `dest` (a
+// validated rebase:// URL carrying the token) and offers a manual fallback.
+// The token reaches the app via its custom-scheme handler, never another origin.
+func (p *OIDCProvider) renderAppHandoff(w http.ResponseWriter, dest string) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	page := fmt.Sprintf(`<!doctype html><html><head><meta charset="utf-8"><title>rebase</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;background:#0d1117;color:#d4dae2;display:flex;min-height:100vh;align-items:center;justify-content:center;margin:0}
+.card{text-align:center}h1{letter-spacing:.08em}a{display:inline-block;margin-top:16px;padding:10px 16px;background:#7aa2f7;color:#0d1117;border-radius:6px;text-decoration:none;font-weight:600}
+p{color:#9aa6b2}.hint{color:#5e6a76;font-size:13px}</style></head>
+<body><div class="card"><h1>rebase</h1><p>Opening the rebase app…</p>
+<a id="open" href="%s">Open rebase</a>
+<p class="hint">You can close this tab.</p></div>
+<script>location.href=document.getElementById('open').getAttribute('href');</script>
+</body></html>`, html.EscapeString(dest))
+	_, _ = io.WriteString(w, page)
 }
 
 // HandleLogout clears the session and redirects to root.

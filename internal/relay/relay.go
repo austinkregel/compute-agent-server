@@ -126,7 +126,7 @@ type backupJob struct {
 type fileOp struct {
 	ClientID   string
 	DashConnID string
-	Type       string // put, delete, chmod
+	Type       string // get, put, delete, chmod
 	RequestID  string
 	StartedAt  time.Time
 	LastSeenAt time.Time
@@ -235,6 +235,8 @@ func (r *Relay) HandleDashboardEvent(dc *ws.DashboardConn, msg *ws.Message) {
 		r.handleBackupApprove(dc, data)
 
 	// File ops
+	case "file_get_request":
+		r.handleFileGetRequest(dc, data)
 	case "file_put_start":
 		r.handleFilePutStart(dc, data)
 	case "file_put_chunk":
@@ -312,6 +314,10 @@ func (r *Relay) HandleAgentEvent(clientID string, msg *ws.Message) {
 		r.handleBackupError(clientID, data)
 
 	// File ops
+	case "file_get_chunk":
+		r.handleFileGetChunk(clientID, data)
+	case "file_get_result":
+		r.handleFileGetResult(clientID, data)
 	case "file_put_result":
 		r.handleFilePutResult(clientID, data)
 	case "file_delete_result":
@@ -888,6 +894,75 @@ func (r *Relay) handleFilePutStart(dc *ws.DashboardConn, data map[string]any) {
 		"requestId": reqID,
 		"path":      data["path"],
 	})
+}
+
+// handleFileGetRequest forwards a read request to the agent and registers the
+// operation so the streamed chunks + terminal result route back to the
+// originating dashboard connection.
+func (r *Relay) handleFileGetRequest(dc *ws.DashboardConn, data map[string]any) {
+	clientID := str(data, "clientId")
+	if clientID == "" || !r.store.HasClient(clientID) {
+		r.dash.SendTo(dc.ID, "file_get_result", map[string]any{
+			"ok": false, "error": "client offline", "clientId": clientID,
+			"requestId": str(data, "requestId"), "path": data["path"],
+		})
+		return
+	}
+
+	reqID := str(data, "requestId")
+	if reqID == "" {
+		reqID = uuid.NewString()
+	}
+
+	now := time.Now()
+	r.fileMu.Lock()
+	r.fileOps[reqID] = &fileOp{
+		ClientID:   clientID,
+		DashConnID: dc.ID,
+		Type:       "get",
+		RequestID:  reqID,
+		StartedAt:  now,
+		LastSeenAt: now,
+	}
+	r.fileMu.Unlock()
+
+	payload := copyMap(data)
+	payload["requestId"] = reqID
+	ws.SendSignedCommand(r.store, clientID, "file_get_request", payload, r.log)
+
+	r.dash.SendTo(dc.ID, "file_get_dispatched", map[string]any{
+		"clientId":  clientID,
+		"requestId": reqID,
+		"path":      data["path"],
+	})
+}
+
+func (r *Relay) handleFileGetChunk(clientID string, data map[string]any) {
+	reqID := str(data, "requestId")
+	r.fileMu.Lock()
+	op, ok := r.fileOps[reqID]
+	if ok {
+		op.LastSeenAt = time.Now()
+	}
+	r.fileMu.Unlock()
+	if !ok {
+		return
+	}
+	r.dash.SendTo(op.DashConnID, "file_get_chunk", mergeClientID(clientID, data))
+}
+
+func (r *Relay) handleFileGetResult(clientID string, data map[string]any) {
+	reqID := str(data, "requestId")
+	r.fileMu.Lock()
+	op, ok := r.fileOps[reqID]
+	if ok {
+		delete(r.fileOps, reqID)
+	}
+	r.fileMu.Unlock()
+	if !ok {
+		return
+	}
+	r.dash.SendTo(op.DashConnID, "file_get_result", mergeClientID(clientID, data))
 }
 
 func (r *Relay) handleFilePutChunk(dc *ws.DashboardConn, data map[string]any) {
