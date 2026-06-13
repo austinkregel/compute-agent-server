@@ -85,6 +85,40 @@ func TestStore_UpdateStats(t *testing.T) {
 	}
 }
 
+func TestStore_UpdateStats_ParsesDirectAdvert(t *testing.T) {
+	s := New()
+	s.AddClient("node-1", nil)
+
+	changed := s.UpdateStats("node-1", map[string]any{
+		"direct": map[string]any{
+			"addr":        "100.64.0.5:7420",
+			"certSha256":  "abc123",
+			"pinRequired": true,
+			"scheme":      "wss",
+		},
+	})
+	if !changed {
+		t.Error("UpdateStats should report changed when a direct advert appears")
+	}
+
+	pub := s.PublicClients()
+	if len(pub) != 1 {
+		t.Fatalf("PublicClients len = %d", len(pub))
+	}
+	if pub[0].DirectAddr != "100.64.0.5:7420" || pub[0].DirectCertSHA256 != "abc123" || !pub[0].DirectPinRequired {
+		t.Errorf("direct fields not surfaced: %+v", pub[0])
+	}
+
+	// Withdrawing the advert clears the fields and reports changed.
+	changed = s.UpdateStats("node-1", map[string]any{"cpu": float64(1)})
+	if !changed {
+		t.Error("UpdateStats should report changed when a direct advert is withdrawn")
+	}
+	if s.PublicClients()[0].DirectAddr != "" {
+		t.Error("direct addr should be cleared when advert withdrawn")
+	}
+}
+
 func TestStore_StatsHistoryBounded(t *testing.T) {
 	s := New()
 	s.AddClient("node-1", nil)

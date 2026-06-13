@@ -74,6 +74,9 @@ func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
 	// Wire agent callbacks
 	s.agents.OnConnect = func(clientID string) {
 		s.dashboard.BroadcastClientList()
+		// Push the canonical command allowlist to the freshly-connected agent.
+		ws.SendSignedCommand(store, clientID, "exec_allowlist",
+			map[string]any{"commands": s.cfg.ExecAllowedCommands}, log)
 	}
 	s.agents.OnDisconnect = func(clientID string) {
 		s.dashboard.BroadcastClientList()

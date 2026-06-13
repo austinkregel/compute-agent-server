@@ -77,6 +77,27 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 	if cfg.LogFile == "" {
 		t.Error("LogFile should have default value")
 	}
+	if len(cfg.ExecAllowedCommands) != len(DefaultExecAllowedCommands) {
+		t.Errorf("ExecAllowedCommands = %v, want defaults", cfg.ExecAllowedCommands)
+	}
+}
+
+func TestLoad_ExecAllowlistEnvOverride(t *testing.T) {
+	t.Setenv("EXEC_ALLOWED_COMMANDS", "git, ls ,  make")
+	p := writeTestConfig(t, `{"port":8443,"authToken":"secret"}`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	want := []string{"git", "ls", "make"}
+	if len(cfg.ExecAllowedCommands) != len(want) {
+		t.Fatalf("ExecAllowedCommands = %v, want %v", cfg.ExecAllowedCommands, want)
+	}
+	for i := range want {
+		if cfg.ExecAllowedCommands[i] != want[i] {
+			t.Errorf("ExecAllowedCommands[%d] = %q, want %q", i, cfg.ExecAllowedCommands[i], want[i])
+		}
+	}
 }
 
 func TestLoad_MissingPort(t *testing.T) {

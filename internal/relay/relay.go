@@ -126,7 +126,7 @@ type backupJob struct {
 type fileOp struct {
 	ClientID   string
 	DashConnID string
-	Type       string // get, put, delete, chmod
+	Type       string // get, put, delete, chmod, mkdir, rename
 	RequestID  string
 	StartedAt  time.Time
 	LastSeenAt time.Time
@@ -247,10 +247,18 @@ func (r *Relay) HandleDashboardEvent(dc *ws.DashboardConn, msg *ws.Message) {
 		r.handleFileDeleteRequest(dc, data)
 	case "file_chmod_request":
 		r.handleFileChmodRequest(dc, data)
+	case "file_mkdir_request":
+		r.handleFileMkdirRequest(dc, data)
+	case "file_rename_request":
+		r.handleFileRenameRequest(dc, data)
 
 	// Dir browse
 	case "dir_list_request":
 		r.handleDirListRequest(dc, data)
+
+	// Generic command exec
+	case "exec_request":
+		r.handleExecRequest(dc, data)
 
 	// Kiosk
 	case "kiosk_set":
@@ -324,10 +332,18 @@ func (r *Relay) HandleAgentEvent(clientID string, msg *ws.Message) {
 		r.handleFileDeleteResult(clientID, data)
 	case "file_chmod_result":
 		r.handleFileChmodResult(clientID, data)
+	case "file_mkdir_result":
+		r.handleFileMkdirResult(clientID, data)
+	case "file_rename_result":
+		r.handleFileRenameResult(clientID, data)
 
 	// Dir browse
 	case "dir_list_response":
 		r.handleDirListResponse(clientID, data)
+
+	// Generic command exec
+	case "exec_result":
+		r.handleExecResult(clientID, data)
 
 	// Kiosk
 	case "kiosk_status":
@@ -1114,6 +1130,109 @@ func (r *Relay) handleFileChmodResult(clientID string, data map[string]any) {
 	r.dash.SendTo(op.DashConnID, "file_chmod_result", mergeClientID(clientID, data))
 }
 
+func (r *Relay) handleFileMkdirRequest(dc *ws.DashboardConn, data map[string]any) {
+	clientID := str(data, "clientId")
+	if clientID == "" || !r.store.HasClient(clientID) {
+		r.dash.SendTo(dc.ID, "file_mkdir_result", map[string]any{"ok": false, "error": "client offline"})
+		return
+	}
+
+	reqID := str(data, "requestId")
+	if reqID == "" {
+		reqID = uuid.NewString()
+	}
+
+	now := time.Now()
+	r.fileMu.Lock()
+	r.fileOps[reqID] = &fileOp{
+		ClientID:   clientID,
+		DashConnID: dc.ID,
+		Type:       "mkdir",
+		RequestID:  reqID,
+		StartedAt:  now,
+		LastSeenAt: now,
+	}
+	r.fileMu.Unlock()
+
+	payload := copyMap(data)
+	payload["requestId"] = reqID
+	ws.SendSignedCommand(r.store, clientID, "file_mkdir_request", payload, r.log)
+
+	r.dash.SendTo(dc.ID, "file_mkdir_dispatched", map[string]any{
+		"clientId":  clientID,
+		"requestId": reqID,
+		"path":      data["path"],
+	})
+}
+
+func (r *Relay) handleFileMkdirResult(clientID string, data map[string]any) {
+	reqID := str(data, "requestId")
+	r.fileMu.Lock()
+	op, ok := r.fileOps[reqID]
+	if ok {
+		delete(r.fileOps, reqID)
+	}
+	r.fileMu.Unlock()
+	if !ok {
+		return
+	}
+	r.dash.SendTo(op.DashConnID, "file_mkdir_result", mergeClientID(clientID, data))
+}
+
+func (r *Relay) handleFileRenameRequest(dc *ws.DashboardConn, data map[string]any) {
+	clientID := str(data, "clientId")
+	if clientID == "" || !r.store.HasClient(clientID) {
+		r.dash.SendTo(dc.ID, "file_rename_result", map[string]any{"ok": false, "error": "client offline"})
+		return
+	}
+	if str(data, "newPath") == "" {
+		r.dash.SendTo(dc.ID, "file_rename_result", map[string]any{"ok": false, "error": "newPath required"})
+		return
+	}
+
+	reqID := str(data, "requestId")
+	if reqID == "" {
+		reqID = uuid.NewString()
+	}
+
+	now := time.Now()
+	r.fileMu.Lock()
+	r.fileOps[reqID] = &fileOp{
+		ClientID:   clientID,
+		DashConnID: dc.ID,
+		Type:       "rename",
+		RequestID:  reqID,
+		StartedAt:  now,
+		LastSeenAt: now,
+	}
+	r.fileMu.Unlock()
+
+	payload := copyMap(data)
+	payload["requestId"] = reqID
+	ws.SendSignedCommand(r.store, clientID, "file_rename_request", payload, r.log)
+
+	r.dash.SendTo(dc.ID, "file_rename_dispatched", map[string]any{
+		"clientId":  clientID,
+		"requestId": reqID,
+		"path":      data["path"],
+		"newPath":   data["newPath"],
+	})
+}
+
+func (r *Relay) handleFileRenameResult(clientID string, data map[string]any) {
+	reqID := str(data, "requestId")
+	r.fileMu.Lock()
+	op, ok := r.fileOps[reqID]
+	if ok {
+		delete(r.fileOps, reqID)
+	}
+	r.fileMu.Unlock()
+	if !ok {
+		return
+	}
+	r.dash.SendTo(op.DashConnID, "file_rename_result", mergeClientID(clientID, data))
+}
+
 // --- Dir browse handlers ---
 
 func (r *Relay) handleDirListRequest(dc *ws.DashboardConn, data map[string]any) {
@@ -1155,6 +1274,37 @@ func (r *Relay) handleDirListRequest(dc *ws.DashboardConn, data map[string]any) 
 
 func (r *Relay) handleDirListResponse(clientID string, data map[string]any) {
 	r.dash.Broadcast("dir_list_response", mergeClientID(clientID, data))
+}
+
+// --- Git handlers ---
+
+func (r *Relay) handleExecRequest(dc *ws.DashboardConn, data map[string]any) {
+	clientID := str(data, "clientId")
+	if clientID == "" || !r.store.HasClient(clientID) {
+		r.dash.SendTo(dc.ID, "exec_result", map[string]any{
+			"ok": false, "error": "client offline", "clientId": clientID,
+			"requestId": str(data, "requestId"),
+		})
+		return
+	}
+
+	reqID := str(data, "requestId")
+	if reqID == "" {
+		reqID = uuid.NewString()
+	}
+
+	payload := copyMap(data)
+	payload["requestId"] = reqID
+	ws.SendSignedCommand(r.store, clientID, "exec_request", payload, r.log)
+
+	r.dash.SendTo(dc.ID, "exec_dispatched", map[string]any{
+		"clientId":  clientID,
+		"requestId": reqID,
+	})
+}
+
+func (r *Relay) handleExecResult(clientID string, data map[string]any) {
+	r.dash.Broadcast("exec_result", mergeClientID(clientID, data))
 }
 
 // --- Kiosk handlers ---

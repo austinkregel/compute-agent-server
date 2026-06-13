@@ -23,8 +23,20 @@ type Config struct {
 	ServerURL                   string   `json:"serverUrl"`
 	DashboardAllowedOrigins     []string `json:"dashboardAllowedOrigins"`
 
+	// ExecAllowedCommands is the canonical command allowlist pushed to agents
+	// (governs exec + admin_run). Managed centrally here, not per-agent.
+	ExecAllowedCommands []string `json:"execAllowedCommands"`
+
 	OIDC    OIDCConfig    `json:"oidc"`
 	Logging LoggingConfig `json:"logging"`
+}
+
+// DefaultExecAllowedCommands is an IDE-friendly allowlist applied when the
+// config doesn't specify one. Entries match command-name prefixes on the agent.
+var DefaultExecAllowedCommands = []string{
+	"git", "ls", "cat", "head", "tail", "wc", "find", "grep", "rg", "which", "env",
+	"go", "node", "npm", "npx", "pnpm", "yarn", "python", "python3", "pip", "pip3",
+	"make", "cargo", "rustc",
 }
 
 // OIDCConfig holds OpenID Connect provider settings.
@@ -134,6 +146,9 @@ func (c *Config) applyDefaults() {
 	if len(c.OIDC.Scopes) == 0 {
 		c.OIDC.Scopes = []string{"openid"}
 	}
+	if len(c.ExecAllowedCommands) == 0 {
+		c.ExecAllowedCommands = append([]string(nil), DefaultExecAllowedCommands...)
+	}
 }
 
 func (c *Config) applyEnvOverrides() {
@@ -144,6 +159,15 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("AUTH_TOKEN"); v != "" {
 		c.AuthToken = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("EXEC_ALLOWED_COMMANDS"); v != "" {
+		var cmds []string
+		for _, part := range strings.Split(v, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				cmds = append(cmds, p)
+			}
+		}
+		c.ExecAllowedCommands = cmds
 	}
 	if v := os.Getenv("AGENT_AUTH_MAX_SKEW_SEC"); v != "" {
 		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {

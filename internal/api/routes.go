@@ -81,6 +81,10 @@ func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Ro
 		r.Post("/api/server/shutdown", handleShutdown(deps))
 		r.Post("/api/client/{clientId}/keys/resync", handleKeysResync(deps))
 
+		// Canonical command allowlist (pushed to all agents on change + on connect)
+		r.Get("/api/server/exec-allowlist", handleExecAllowlistGet(deps))
+		r.Put("/api/server/exec-allowlist", handleExecAllowlistPut(deps))
+
 		// Local cron
 		r.Get("/api/cron", handleCronGet(deps))
 		r.Put("/api/cron", handleCronPut(deps))
@@ -271,6 +275,43 @@ func handleKeysResync(deps Deps) http.HandlerFunc {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"status": "sent", "clientId": clientID, "githubUser": user,
 		})
+	}
+}
+
+// handleExecAllowlistGet returns the canonical command allowlist.
+func handleExecAllowlistGet(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, map[string]any{"commands": deps.Config.ExecAllowedCommands})
+	}
+}
+
+// handleExecAllowlistPut updates the canonical allowlist and pushes it to every
+// connected agent (so the policy syncs out without a restart).
+func handleExecAllowlistPut(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Commands []string `json:"commands"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
+			return
+		}
+		cmds := make([]string, 0, len(body.Commands))
+		for _, c := range body.Commands {
+			if s := strings.TrimSpace(c); s != "" {
+				cmds = append(cmds, s)
+			}
+		}
+		deps.Config.ExecAllowedCommands = cmds
+		sent := 0
+		for _, clientID := range deps.Store.ClientIDs() {
+			if ws.SendSignedCommand(deps.Store, clientID, "exec_allowlist",
+				map[string]any{"commands": cmds}, deps.Log) {
+				sent++
+			}
+		}
+		deps.Log.Info("exec allowlist updated", "count", len(cmds), "agentsUpdated", sent)
+		writeJSON(w, http.StatusOK, map[string]any{"commands": cmds, "agentsUpdated": sent})
 	}
 }
 

@@ -744,6 +744,149 @@ func TestDirListResponse_Broadcast(t *testing.T) {
 	}
 }
 
+func TestFileMkdirRequest_RoutedAndCleared(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_mkdir_request", map[string]any{
+		"clientId": "node-1", "path": "/srv/new",
+	}))
+	if md.findSent("dash-1", "file_mkdir_dispatched") == nil {
+		t.Fatal("file_mkdir_dispatched not sent")
+	}
+
+	r.fileMu.RLock()
+	var reqID string
+	var op *fileOp
+	for id, o := range r.fileOps {
+		reqID, op = id, o
+	}
+	r.fileMu.RUnlock()
+	if op == nil || op.Type != "mkdir" {
+		t.Fatalf("mkdir op not registered (op=%v)", op)
+	}
+
+	r.HandleAgentEvent("node-1", makeMsg("file_mkdir_result", map[string]any{
+		"requestId": reqID, "ok": true, "path": "/srv/new",
+	}))
+	if md.findSent("dash-1", "file_mkdir_result") == nil {
+		t.Fatal("file_mkdir_result not routed to owner")
+	}
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if count != 0 {
+		t.Errorf("file ops = %d after result, want 0", count)
+	}
+}
+
+func TestFileRenameRequest_RequiresNewPath(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_rename_request", map[string]any{
+		"clientId": "node-1", "path": "/srv/a",
+	}))
+
+	msg := md.findSent("dash-1", "file_rename_result")
+	if msg == nil || msg.Data["ok"] != false {
+		t.Fatalf("expected ok:false rename result for missing newPath, got %v", msg)
+	}
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if count != 0 {
+		t.Errorf("file ops = %d, want 0 (missing newPath)", count)
+	}
+}
+
+func TestFileRenameRequest_RoutedAndCleared(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_rename_request", map[string]any{
+		"clientId": "node-1", "path": "/srv/a", "newPath": "/srv/b",
+	}))
+	r.fileMu.RLock()
+	var reqID string
+	var op *fileOp
+	for id, o := range r.fileOps {
+		reqID, op = id, o
+	}
+	r.fileMu.RUnlock()
+	if op == nil || op.Type != "rename" {
+		t.Fatalf("rename op not registered (op=%v)", op)
+	}
+
+	r.HandleAgentEvent("node-1", makeMsg("file_rename_result", map[string]any{
+		"requestId": reqID, "ok": true, "path": "/srv/b",
+	}))
+	if md.findSent("dash-1", "file_rename_result") == nil {
+		t.Fatal("file_rename_result not routed to owner")
+	}
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if count != 0 {
+		t.Errorf("file ops = %d after result, want 0", count)
+	}
+}
+
+// --- Exec tests ---
+
+func TestExecRequest_DispatchesToAgent(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("exec_request", map[string]any{
+		"clientId": "node-1", "command": "git status --porcelain --branch", "cwd": "/srv/project",
+	}))
+
+	if md.findSent("dash-1", "exec_dispatched") == nil {
+		t.Fatal("exec_dispatched not sent to dash-1")
+	}
+}
+
+func TestExecRequest_ClientOffline(t *testing.T) {
+	r, md, _ := testRelay(t)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("exec_request", map[string]any{
+		"clientId": "ghost", "command": "git status", "requestId": "req-1",
+	}))
+
+	msg := md.findSent("dash-1", "exec_result")
+	if msg == nil {
+		t.Fatal("offline exec_result not sent to dash-1")
+	}
+	if msg.Data["ok"] != false {
+		t.Errorf("ok = %v, want false", msg.Data["ok"])
+	}
+}
+
+func TestExecResult_Broadcast(t *testing.T) {
+	r, md, _ := testRelay(t)
+
+	r.HandleAgentEvent("node-1", makeMsg("exec_result", map[string]any{
+		"requestId": "req-1", "ok": true, "code": float64(0), "stdout": "## main\n",
+	}))
+
+	msg := md.findBroadcast("exec_result")
+	if msg == nil {
+		t.Fatal("exec_result not broadcast")
+	}
+	if msg.Data["clientId"] != "node-1" {
+		t.Errorf("clientId = %v", msg.Data["clientId"])
+	}
+	if msg.Data["stdout"] != "## main\n" {
+		t.Errorf("stdout = %v", msg.Data["stdout"])
+	}
+}
+
 // --- Kiosk tests ---
 
 func TestKioskSet_ValidMessage(t *testing.T) {

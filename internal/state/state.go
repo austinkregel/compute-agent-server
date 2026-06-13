@@ -28,6 +28,12 @@ type ClientEntry struct {
 	CPUs         string
 	AgentVersion string
 
+	// Direct-connection advertisement (from stats.direct); empty when the agent
+	// isn't advertising a P2P endpoint.
+	DirectAddr        string
+	DirectCertSHA256  string
+	DirectPinRequired bool
+
 	// Command signing — set during handshake
 	SessionNonce string
 	// Signer is kept as an opaque interface to avoid import cycles.
@@ -47,6 +53,10 @@ type PublicClient struct {
 	Arch          string `json:"arch,omitempty"`
 	CPUs          string `json:"cpus,omitempty"`
 	AgentVersion  string `json:"agentVersion,omitempty"`
+	// Direct-connection advertisement, surfaced so the IDE can attempt P2P.
+	DirectAddr        string `json:"directAddr,omitempty"`
+	DirectCertSHA256  string `json:"directCertSha256,omitempty"`
+	DirectPinRequired bool   `json:"directPinRequired,omitempty"`
 }
 
 // ShellSession tracks an active PTY relay.
@@ -194,15 +204,18 @@ func (s *Store) PublicClients() []PublicClient {
 	for _, e := range s.clients {
 		e.Mu.Lock()
 		pub := PublicClient{
-			ClientID:      e.ClientID,
-			LastPong:      e.LastPong.UnixMilli(),
-			Authenticated: e.Authenticated,
-			Platform:      e.Platform,
-			Release:       e.Release,
-			Hostname:      e.Hostname,
-			Arch:          e.Arch,
-			CPUs:          e.CPUs,
-			AgentVersion:  e.AgentVersion,
+			ClientID:          e.ClientID,
+			LastPong:          e.LastPong.UnixMilli(),
+			Authenticated:     e.Authenticated,
+			Platform:          e.Platform,
+			Release:           e.Release,
+			Hostname:          e.Hostname,
+			Arch:              e.Arch,
+			CPUs:              e.CPUs,
+			AgentVersion:      e.AgentVersion,
+			DirectAddr:        e.DirectAddr,
+			DirectCertSHA256:  e.DirectCertSHA256,
+			DirectPinRequired: e.DirectPinRequired,
 		}
 		e.Mu.Unlock()
 		out = append(out, pub)
@@ -283,6 +296,22 @@ func (s *Store) UpdateStats(clientID string, stats map[string]any) bool {
 		}
 		if newVersion != "" && newVersion != entry.AgentVersion {
 			entry.AgentVersion = newVersion
+			changed = true
+		}
+
+		// Direct-connection advertisement (stats.direct). Parsed defensively;
+		// withdrawn (absent) → fields cleared so a stale endpoint isn't dialed.
+		var addr, certSha string
+		var pinReq bool
+		if direct, ok := stats["direct"].(map[string]any); ok {
+			addr, _ = direct["addr"].(string)
+			certSha, _ = direct["certSha256"].(string)
+			pinReq, _ = direct["pinRequired"].(bool)
+		}
+		if addr != entry.DirectAddr || certSha != entry.DirectCertSHA256 || pinReq != entry.DirectPinRequired {
+			entry.DirectAddr = addr
+			entry.DirectCertSHA256 = certSha
+			entry.DirectPinRequired = pinReq
 			changed = true
 		}
 		entry.Mu.Unlock()
