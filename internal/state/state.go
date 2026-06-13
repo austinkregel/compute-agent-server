@@ -18,6 +18,9 @@ type ClientEntry struct {
 	ClientID      string
 	Conn          *websocket.Conn // nil in tests
 	LastPong      time.Time
+	// RttMs is the most recent ping→pong round-trip in milliseconds, measured
+	// from the echoed ping timestamp. 0 until the first pong is received.
+	RttMs         int64
 	Authenticated bool
 
 	// Populated from stats updates
@@ -46,6 +49,8 @@ type ClientEntry struct {
 type PublicClient struct {
 	ClientID      string `json:"clientId"`
 	LastPong      int64  `json:"lastPong"`
+	// PingRttMs is the last measured ping→pong round-trip (ms). Omitted until known.
+	PingRttMs     int64  `json:"pingRttMs,omitempty"`
 	Authenticated bool   `json:"authenticated"`
 	Platform      string `json:"platform,omitempty"`
 	Release       string `json:"release,omitempty"`
@@ -206,6 +211,7 @@ func (s *Store) PublicClients() []PublicClient {
 		pub := PublicClient{
 			ClientID:          e.ClientID,
 			LastPong:          e.LastPong.UnixMilli(),
+			PingRttMs:         e.RttMs,
 			Authenticated:     e.Authenticated,
 			Platform:          e.Platform,
 			Release:           e.Release,

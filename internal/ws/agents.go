@@ -151,12 +151,22 @@ func (h *AgentHandler) readLoop(ctx context.Context, clientID string, conn *webs
 			continue
 		}
 
-		// Handle pong internally (update last pong time)
+		// Handle pong internally: update last-pong time and measure round-trip.
+		// The agent echoes our ping's `ts` (Unix ms), so RTT = now - echoed ts.
 		if msg.Event == "pong" {
+			now := time.Now()
+			var pong struct {
+				TS int64 `json:"ts"`
+			}
+			_ = json.Unmarshal(msg.Data, &pong)
 			entry := h.store.GetClient(clientID)
 			if entry != nil {
 				entry.Mu.Lock()
-				entry.LastPong = time.Now()
+				entry.LastPong = now
+				// Guard against clock skew / missing ts: only record sane RTTs.
+				if rtt := now.UnixMilli() - pong.TS; pong.TS > 0 && rtt >= 0 && rtt < 60_000 {
+					entry.RttMs = rtt
+				}
 				entry.Mu.Unlock()
 			}
 			continue
