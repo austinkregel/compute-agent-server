@@ -82,6 +82,11 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("agent ws upgrade failed", "clientId", clientID, "error", err)
 		return
 	}
+	// Chunked file transfers (file_get/file_put) send 256 KiB chunks (~341 KiB
+	// base64); raise the read limit above coder/websocket's 32 KiB default to
+	// the 1 MiB/frame protocol limit, matching the agent + direct listener.
+	// Otherwise the first large frame trips "read limited" and drops the agent.
+	conn.SetReadLimit(1 << 20)
 
 	h.log.Info("agent connected", "clientId", clientID, "remote", r.RemoteAddr)
 

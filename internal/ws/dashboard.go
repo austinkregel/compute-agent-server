@@ -91,6 +91,9 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.log.Error("dashboard ws upgrade failed", "error", err, "user", user.Sub)
 		return
 	}
+	// Match the agent/server frame limit (1 MiB) so chunked uploads
+	// (file_put_chunk, 256 KiB) aren't truncated at the 32 KiB default.
+	conn.SetReadLimit(1 << 20)
 
 	// Generate connection ID
 	connID := generateConnID()
