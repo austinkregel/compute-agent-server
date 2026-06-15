@@ -46,6 +46,9 @@ type SessionUser struct {
 	Email   string `json:"email,omitempty"`
 	Name    string `json:"name,omitempty"`
 	Picture string `json:"picture,omitempty"`
+	// Groups carries the union of the "groups" and "roles" claims (if the IdP
+	// emits them). Used for admin role gating; see OIDCProvider.IsAdmin.
+	Groups []string `json:"groups,omitempty"`
 }
 
 // sessionPayload is what gets encrypted into the session cookie.
@@ -263,11 +266,13 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Extract claims
 	var claims struct {
-		Sub               string `json:"sub"`
-		Email             string `json:"email"`
-		Name              string `json:"name"`
-		PreferredUsername  string `json:"preferred_username"`
-		Picture           string `json:"picture"`
+		Sub               string   `json:"sub"`
+		Email             string   `json:"email"`
+		Name              string   `json:"name"`
+		PreferredUsername string   `json:"preferred_username"`
+		Picture           string   `json:"picture"`
+		Groups            []string `json:"groups"`
+		Roles             []string `json:"roles"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		http.Error(w, "failed to parse claims", http.StatusInternalServerError)
@@ -287,6 +292,7 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		Email:   claims.Email,
 		Name:    name,
 		Picture: claims.Picture,
+		Groups:  mergeGroups(claims.Groups, claims.Roles),
 	}
 
 	// Create encrypted session cookie
@@ -349,6 +355,7 @@ func (p *OIDCProvider) HandleAuthStatus(w http.ResponseWriter, r *http.Request) 
 		json.NewEncoder(w).Encode(map[string]any{
 			"authenticated": true,
 			"user":          user,
+			"isAdmin":       p.IsAdmin(user),
 		})
 	} else {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -376,10 +383,79 @@ func (p *OIDCProvider) RequireAuth(next http.Handler) http.Handler {
 	})
 }
 
+// RequireAdmin is a middleware that rejects unauthenticated requests with 401
+// and authenticated-but-non-admin requests with 403. It is self-contained (it
+// resolves the session itself) so it can be used independently of RequireAuth.
+func (p *OIDCProvider) RequireAdmin(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		user := p.GetSessionUser(r)
+		if user == nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]any{"error": "unauthorized"})
+			return
+		}
+		if !p.IsAdmin(user) {
+			p.log.Warn("admin endpoint denied for non-admin user", "sub", user.Sub, "path", r.URL.Path)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": "forbidden: admin role required"})
+			return
+		}
+		ctx := context.WithValue(r.Context(), userContextKey, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// IsAdmin reports whether the user passes the admin role gate. When no admin
+// group is configured the gate is inert and every authenticated user is treated
+// as admin (preserving pre-gate behavior); a startup warning is logged in that
+// case. When a group is configured, the user must carry it in their groups/roles
+// claim. Matching is case-insensitive and whitespace-trimmed.
+func (p *OIDCProvider) IsAdmin(user *SessionUser) bool {
+	if user == nil {
+		return false
+	}
+	group := strings.TrimSpace(p.cfg.AdminGroup)
+	if group == "" {
+		return true
+	}
+	for _, g := range user.Groups {
+		if strings.EqualFold(strings.TrimSpace(g), group) {
+			return true
+		}
+	}
+	return false
+}
+
 // UserFromContext retrieves the session user from the request context.
 func UserFromContext(ctx context.Context) *SessionUser {
 	user, _ := ctx.Value(userContextKey).(*SessionUser)
 	return user
+}
+
+// mergeGroups returns the de-duplicated union of the groups and roles claims,
+// preserving order and dropping empties. Used so an IdP that emits either claim
+// (or both) feeds a single membership list for admin gating.
+func mergeGroups(groups, roles []string) []string {
+	if len(groups) == 0 && len(roles) == 0 {
+		return nil
+	}
+	seen := make(map[string]bool, len(groups)+len(roles))
+	out := make([]string, 0, len(groups)+len(roles))
+	for _, g := range append(append([]string(nil), groups...), roles...) {
+		g = strings.TrimSpace(g)
+		if g == "" {
+			continue
+		}
+		key := strings.ToLower(g)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, g)
+	}
+	return out
 }
 
 // --- Session Management ---
@@ -432,12 +508,14 @@ func (p *OIDCProvider) ValidateAccessToken(ctx context.Context, tokenStr string)
 	// Try to verify against each key
 	var claims josejwt.Claims
 	var customClaims struct {
-		Email             string `json:"email"`
-		Name              string `json:"name"`
-		PreferredUsername  string `json:"preferred_username"`
-		Picture           string `json:"picture"`
-		ClientID          string `json:"client_id"`
-		Azp               string `json:"azp"`
+		Email             string   `json:"email"`
+		Name              string   `json:"name"`
+		PreferredUsername string   `json:"preferred_username"`
+		Picture           string   `json:"picture"`
+		ClientID          string   `json:"client_id"`
+		Azp               string   `json:"azp"`
+		Groups            []string `json:"groups"`
+		Roles             []string `json:"roles"`
 	}
 
 	verified := false
@@ -495,6 +573,7 @@ func (p *OIDCProvider) ValidateAccessToken(ctx context.Context, tokenStr string)
 		Email:   customClaims.Email,
 		Name:    name,
 		Picture: customClaims.Picture,
+		Groups:  mergeGroups(customClaims.Groups, customClaims.Roles),
 	}, nil
 }
 

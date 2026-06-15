@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/austinkregel/backup-server/internal/allowlist"
 	"github.com/austinkregel/backup-server/internal/config"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/logging"
@@ -20,9 +21,10 @@ func testDeps(t *testing.T) Deps {
 	}
 	t.Cleanup(func() { log.Sync() })
 	return Deps{
-		Store:  state.New(),
-		Log:    log,
-		Config: &config.Config{GithubUser: "testuser"},
+		Store:     state.New(),
+		Log:       log,
+		Config:    &config.Config{GithubUser: "testuser"},
+		Allowlist: allowlist.New("", nil, log), // in-memory (no persistence) for tests
 	}
 }
 
@@ -479,6 +481,147 @@ func TestAuthMiddleware_AllowsAuthenticated(t *testing.T) {
 	w := doRequest(t, r, "GET", "/api/status", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200", w.Code)
+	}
+}
+
+// --- Admin middleware gating ---
+
+func TestAdminMiddleware_GatesAllowlistButNotStatus(t *testing.T) {
+	deps := testDeps(t)
+	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
+
+	// Admin middleware that always rejects with 403.
+	deps.AdminMiddleware = func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]any{"error": "forbidden"})
+		})
+	}
+	r := NewRouter(deps, nil)
+
+	// Admin-gated route is blocked.
+	if w := doRequest(t, r, "GET", "/api/server/exec-allowlist", ""); w.Code != http.StatusForbidden {
+		t.Fatalf("exec-allowlist GET = %d, want 403", w.Code)
+	}
+	if w := doRequest(t, r, "PUT", "/api/server/exec-allowlist", `{"commands":["ls"]}`); w.Code != http.StatusForbidden {
+		t.Fatalf("exec-allowlist PUT = %d, want 403", w.Code)
+	}
+	if w := doRequest(t, r, "POST", "/api/server/restart", `{"clientId":"x"}`); w.Code != http.StatusForbidden {
+		t.Fatalf("restart = %d, want 403", w.Code)
+	}
+
+	// Non-admin protected route is unaffected.
+	if w := doRequest(t, r, "GET", "/api/status", ""); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (not admin-gated)", w.Code)
+	}
+}
+
+func TestAdminMiddleware_NilAllowsAuthenticated(t *testing.T) {
+	deps := testDeps(t)
+	deps.Allowlist = allowlist.New("", []string{"git", "ls"}, deps.Log)
+	// AdminMiddleware nil -> no role gating (existing behavior).
+	r := NewRouter(deps, nil)
+
+	w := doRequest(t, r, "GET", "/api/server/exec-allowlist", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 when AdminMiddleware nil", w.Code)
+	}
+	result := decodeJSON(t, w)
+	cmds, ok := result["commands"].([]any)
+	if !ok || len(cmds) != 2 {
+		t.Errorf("commands = %v, want 2 entries", result["commands"])
+	}
+}
+
+// --- Exec allowlist GET/PUT/POST ---
+
+func TestExecAllowlistGet_ReturnsEntriesAndProvenance(t *testing.T) {
+	deps := testDeps(t)
+	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
+	deps.Allowlist.Add([]string{"sha256sum /root/.rebase/bin/rebase-indexer"}, "")
+	r := NewRouter(deps, nil)
+
+	w := doRequest(t, r, "GET", "/api/server/exec-allowlist", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	result := decodeJSON(t, w)
+	entries, ok := result["entries"].([]any)
+	if !ok || len(entries) != 2 {
+		t.Fatalf("entries = %v, want 2", result["entries"])
+	}
+	if result["empty"] != false {
+		t.Errorf("empty = %v, want false", result["empty"])
+	}
+}
+
+func TestExecAllowlistPut_RejectsForbiddenChars(t *testing.T) {
+	deps := testDeps(t)
+	r := NewRouter(deps, nil)
+	w := doRequest(t, r, "PUT", "/api/server/exec-allowlist", `{"commands":["git; rm -rf /"]}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for forbidden chars", w.Code)
+	}
+}
+
+func TestExecAllowlistPut_EmptyRequiresConfirm(t *testing.T) {
+	deps := testDeps(t)
+	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
+	r := NewRouter(deps, nil)
+
+	// Without confirmEmpty -> blocked.
+	if w := doRequest(t, r, "PUT", "/api/server/exec-allowlist", `{"commands":[]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 when clearing without confirm", w.Code)
+	}
+	// With confirmEmpty -> allowed.
+	if w := doRequest(t, r, "PUT", "/api/server/exec-allowlist", `{"commands":[],"confirmEmpty":true}`); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with confirmEmpty", w.Code)
+	}
+	if !deps.Allowlist.IsEmpty() {
+		t.Error("allowlist should be empty after confirmed clear")
+	}
+}
+
+func TestExecAllowlistPost_AddRemove(t *testing.T) {
+	deps := testDeps(t)
+	deps.Allowlist = allowlist.New("", []string{"git", "ls"}, deps.Log)
+	r := NewRouter(deps, nil)
+
+	w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{"add":["cat"],"remove":["ls"]}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	result := decodeJSON(t, w)
+	if added, _ := result["added"].([]any); len(added) != 1 {
+		t.Errorf("added = %v, want [cat]", result["added"])
+	}
+	if removed, _ := result["removed"].([]any); len(removed) != 1 {
+		t.Errorf("removed = %v, want [ls]", result["removed"])
+	}
+	cmds := deps.Allowlist.Commands()
+	if len(cmds) != 2 { // git + cat
+		t.Fatalf("commands = %v, want [git cat]", cmds)
+	}
+}
+
+func TestExecAllowlistPost_RemoveAllRequiresConfirm(t *testing.T) {
+	deps := testDeps(t)
+	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
+	r := NewRouter(deps, nil)
+
+	if w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{"remove":["git"]}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 when remove clears list", w.Code)
+	}
+	if w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{"remove":["git"],"confirmEmpty":true}`); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 with confirmEmpty", w.Code)
+	}
+}
+
+func TestExecAllowlistPost_EmptyBodyRejected(t *testing.T) {
+	deps := testDeps(t)
+	r := NewRouter(deps, nil)
+	if w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 for empty add/remove", w.Code)
 	}
 }
 

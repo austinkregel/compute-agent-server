@@ -589,6 +589,148 @@ func TestRequireAuth_ExpiredSession(t *testing.T) {
 	}
 }
 
+// --- Admin role gating ---
+
+func setupAdminProvider(t *testing.T, mock *mockOIDCServer, adminGroup string) *OIDCProvider {
+	t.Helper()
+	cfg := config.OIDCConfig{
+		Enabled:      true,
+		Issuer:       mock.server.URL,
+		ClientID:     "test-client-id",
+		ClientSecret: "test-client-secret",
+		RedirectURI:  mock.server.URL + "/auth/callback",
+		BaseURL:      mock.server.URL,
+		Scopes:       []string{"openid", "profile", "email", "groups"},
+		AdminGroup:   adminGroup,
+	}
+	provider, err := NewOIDCProvider(t.Context(), cfg, testOIDCLogger(t))
+	if err != nil {
+		t.Fatalf("NewOIDCProvider: %v", err)
+	}
+	return provider
+}
+
+func TestIsAdmin_NilUser(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "admins")
+	if p.IsAdmin(nil) {
+		t.Error("nil user should never be admin")
+	}
+}
+
+func TestIsAdmin_NoGroupConfigured_AllowsAny(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "") // gate inert
+	if !p.IsAdmin(&SessionUser{Sub: "u1"}) {
+		t.Error("with no admin group configured, any authenticated user should pass")
+	}
+}
+
+func TestIsAdmin_GroupMembership(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "admins")
+
+	if !p.IsAdmin(&SessionUser{Sub: "u1", Groups: []string{"users", "admins"}}) {
+		t.Error("user in admins group should be admin")
+	}
+	if p.IsAdmin(&SessionUser{Sub: "u2", Groups: []string{"users"}}) {
+		t.Error("user not in admins group should not be admin")
+	}
+	if p.IsAdmin(&SessionUser{Sub: "u3"}) {
+		t.Error("user with no groups should not be admin when a group is required")
+	}
+}
+
+func TestIsAdmin_CaseInsensitive(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "Admins")
+	if !p.IsAdmin(&SessionUser{Sub: "u1", Groups: []string{"  ADMINS "}}) {
+		t.Error("group match should be case-insensitive and whitespace-trimmed")
+	}
+}
+
+func TestRequireAdmin_NoSession_401(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "admins")
+
+	h := p.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest("GET", "/admin", nil)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", w.Code)
+	}
+}
+
+func TestRequireAdmin_NonAdmin_403(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "admins")
+
+	payload := sessionPayload{
+		SessionUser: SessionUser{Sub: "u1", Groups: []string{"users"}},
+		IssuedAt:    time.Now().Unix(),
+		ExpiresAt:   time.Now().Add(24 * time.Hour).Unix(),
+	}
+	encrypted, _ := p.encryptSession(payload)
+
+	h := p.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest("GET", "/admin", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: encrypted})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403 for non-admin", w.Code)
+	}
+}
+
+func TestRequireAdmin_Admin_PassesWithUserInContext(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "admins")
+
+	payload := sessionPayload{
+		SessionUser: SessionUser{Sub: "u1", Groups: []string{"admins"}},
+		IssuedAt:    time.Now().Unix(),
+		ExpiresAt:   time.Now().Add(24 * time.Hour).Unix(),
+	}
+	encrypted, _ := p.encryptSession(payload)
+
+	var ctxUser *SessionUser
+	h := p.RequireAdmin(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctxUser = UserFromContext(r.Context())
+		w.WriteHeader(http.StatusOK)
+	}))
+	req := httptest.NewRequest("GET", "/admin", nil)
+	req.AddCookie(&http.Cookie{Name: sessionCookieName, Value: encrypted})
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 for admin", w.Code)
+	}
+	if ctxUser == nil || ctxUser.Sub != "u1" {
+		t.Fatal("admin user should be in request context")
+	}
+}
+
+func TestMergeGroups(t *testing.T) {
+	got := mergeGroups([]string{"a", "b", ""}, []string{"B", "c"})
+	want := []string{"a", "b", "c"} // case-insensitive dedupe, empties dropped
+	if len(got) != len(want) {
+		t.Fatalf("mergeGroups = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("mergeGroups[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	if mergeGroups(nil, nil) != nil {
+		t.Error("mergeGroups(nil,nil) should be nil")
+	}
+}
+
 // --- Access token validation ---
 
 func TestValidateAccessToken_Valid(t *testing.T) {

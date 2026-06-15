@@ -50,6 +50,14 @@ type OIDCConfig struct {
 	Scopes           []string `json:"scopes"`
 	IDTokenSignAlg   string   `json:"idTokenSigningAlg"`
 	ClientAuthMethod string   `json:"clientAuthMethod"`
+
+	// AdminGroup is the OIDC groups/roles claim value that grants administrative
+	// access (e.g. managing the exec allowlist, restart/shutdown). When empty,
+	// admin endpoints fall back to authenticated-only (no role gating) — the
+	// server logs a warning at startup in that case. To enforce gating, the IdP
+	// must emit the membership in a "groups" or "roles" claim (request the
+	// appropriate scope via Scopes).
+	AdminGroup string `json:"adminGroup"`
 }
 
 // LoggingConfig describes log destination and verbosity.
@@ -208,5 +216,8 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("OIDC_CLIENT_AUTH_METHOD"); v != "" {
 		c.OIDC.ClientAuthMethod = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("OIDC_ADMIN_GROUP"); v != "" {
+		c.OIDC.AdminGroup = strings.TrimSpace(v)
 	}
 }

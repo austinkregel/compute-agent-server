@@ -13,4 +13,6 @@ dist/
 coverage/
 .env
 .ssl_server_token
+exec-allowlist.json
+exec-allowlist.json.tmp
 !pkg.config.json

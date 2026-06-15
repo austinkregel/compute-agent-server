@@ -17,6 +17,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
+	"github.com/austinkregel/backup-server/internal/allowlist"
+	"github.com/austinkregel/backup-server/internal/auth"
 	"github.com/austinkregel/backup-server/internal/config"
 	"github.com/austinkregel/backup-server/internal/relay"
 	"github.com/austinkregel/backup-server/internal/state"
@@ -30,14 +32,20 @@ var githubUserRe = regexp.MustCompile(`^[A-Za-z0-9-]{1,39}$`)
 
 // Deps holds dependencies injected into API handlers.
 type Deps struct {
-	Store  *state.Store
-	Log    *logging.Logger
-	Config *config.Config
-	Relay  *relay.Relay
+	Store     *state.Store
+	Log       *logging.Logger
+	Config    *config.Config
+	Relay     *relay.Relay
+	Allowlist *allowlist.Store
 
 	// AuthStatusHandler is the handler for /api/auth/status.
 	// When OIDC is enabled, this should be OIDCProvider.HandleAuthStatus.
 	AuthStatusHandler http.HandlerFunc
+
+	// AdminMiddleware gates administrative endpoints (exec-allowlist,
+	// restart/shutdown, key resync) on an admin role. When nil, those endpoints
+	// are protected by authMiddleware only (no role gating).
+	AdminMiddleware func(http.Handler) http.Handler
 
 	// StartTime is when the server started, used for uptime calculation.
 	StartTime time.Time
@@ -76,14 +84,24 @@ func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Ro
 		r.Get("/api/client/{clientId}/stats", handleClientStats(deps))
 		r.Get("/api/client/{clientId}/alerts", handleClientAlerts(deps))
 
-		// Admin commands
-		r.Post("/api/server/restart", handleRestart(deps))
-		r.Post("/api/server/shutdown", handleShutdown(deps))
-		r.Post("/api/client/{clientId}/keys/resync", handleKeysResync(deps))
+		// Admin-gated routes: in addition to authentication, these require the
+		// admin role when deps.AdminMiddleware is set (M2). Mutating the exec
+		// allowlist or power-cycling agents is privileged.
+		r.Group(func(r chi.Router) {
+			if deps.AdminMiddleware != nil {
+				r.Use(deps.AdminMiddleware)
+			}
 
-		// Canonical command allowlist (pushed to all agents on change + on connect)
-		r.Get("/api/server/exec-allowlist", handleExecAllowlistGet(deps))
-		r.Put("/api/server/exec-allowlist", handleExecAllowlistPut(deps))
+			// Admin commands
+			r.Post("/api/server/restart", handleRestart(deps))
+			r.Post("/api/server/shutdown", handleShutdown(deps))
+			r.Post("/api/client/{clientId}/keys/resync", handleKeysResync(deps))
+
+			// Canonical command allowlist (pushed to all agents on change + on connect)
+			r.Get("/api/server/exec-allowlist", handleExecAllowlistGet(deps))
+			r.Put("/api/server/exec-allowlist", handleExecAllowlistPut(deps))
+			r.Post("/api/server/exec-allowlist", handleExecAllowlistPost(deps))
+		})
 
 		// Local cron
 		r.Get("/api/cron", handleCronGet(deps))
@@ -278,19 +296,27 @@ func handleKeysResync(deps Deps) http.HandlerFunc {
 	}
 }
 
-// handleExecAllowlistGet returns the canonical command allowlist.
+// handleExecAllowlistGet returns the canonical command allowlist. `commands` is
+// the flat list (back-compat for the desktop app); `entries` carries provenance
+// for the admin UI; `empty` flags the allow-all state.
 func handleExecAllowlistGet(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]any{"commands": deps.Config.ExecAllowedCommands})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"commands": deps.Allowlist.Commands(),
+			"entries":  deps.Allowlist.Entries(),
+			"empty":    deps.Allowlist.IsEmpty(),
+		})
 	}
 }
 
-// handleExecAllowlistPut updates the canonical allowlist and pushes it to every
-// connected agent (so the policy syncs out without a restart).
+// handleExecAllowlistPut replaces the entire allowlist and re-pushes it to every
+// connected agent. Prefer POST add/remove for incremental edits — full replace
+// from the UI can clobber concurrent app auto-grants (M4).
 func handleExecAllowlistPut(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		var body struct {
-			Commands []string `json:"commands"`
+			Commands     []string `json:"commands"`
+			ConfirmEmpty bool     `json:"confirmEmpty"`
 		}
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
@@ -302,17 +328,118 @@ func handleExecAllowlistPut(deps Deps) http.HandlerFunc {
 				cmds = append(cmds, s)
 			}
 		}
-		deps.Config.ExecAllowedCommands = cmds
-		sent := 0
-		for _, clientID := range deps.Store.ClientIDs() {
-			if ws.SendSignedCommand(deps.Store, clientID, "exec_allowlist",
-				map[string]any{"commands": cmds}, deps.Log) {
-				sent++
-			}
+		if bad, ok := firstInvalidCommand(cmds); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "command contains forbidden shell characters (; | & $ ` newline)", "command": bad,
+			})
+			return
 		}
-		deps.Log.Info("exec allowlist updated", "count", len(cmds), "agentsUpdated", sent)
-		writeJSON(w, http.StatusOK, map[string]any{"commands": cmds, "agentsUpdated": sent})
+		// Empty list means allow-all on every agent — require explicit confirmation.
+		if len(cmds) == 0 && !body.ConfirmEmpty {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "refusing to clear allowlist (empty = allow-all); pass confirmEmpty:true to proceed",
+			})
+			return
+		}
+		d := deps.Allowlist.Replace(cmds)
+		sent := pushAllowlist(deps)
+		auditAllowlist(deps, r, "replace", d, sent)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"commands": deps.Allowlist.Commands(), "entries": deps.Allowlist.Entries(),
+			"empty": deps.Allowlist.IsEmpty(), "agentsUpdated": sent,
+		})
 	}
+}
+
+// handleExecAllowlistPost applies atomic add/remove operations so the admin UI
+// and the app's auto-grant can edit the same list without clobbering each other
+// (M4). Body: {"add":[...]}, {"remove":[...]}, optional "source" for added
+// entries, optional "confirmEmpty" to permit a remove that clears the list.
+func handleExecAllowlistPost(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		var body struct {
+			Add          []string `json:"add"`
+			Remove       []string `json:"remove"`
+			Source       string   `json:"source"`
+			ConfirmEmpty bool     `json:"confirmEmpty"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "invalid body"})
+			return
+		}
+		if len(body.Add) == 0 && len(body.Remove) == 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "provide add and/or remove"})
+			return
+		}
+		if bad, ok := firstInvalidCommand(body.Add); !ok {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "command contains forbidden shell characters (; | & $ ` newline)", "command": bad,
+			})
+			return
+		}
+		// Guard against a remove that would clear the list (allow-all).
+		if len(body.Remove) > 0 && len(body.Add) == 0 &&
+			deps.Allowlist.CountAfterRemove(body.Remove) == 0 && !body.ConfirmEmpty {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"error": "refusing to clear allowlist (empty = allow-all); pass confirmEmpty:true to proceed",
+			})
+			return
+		}
+
+		var combined allowlist.Diff
+		if len(body.Remove) > 0 {
+			rd := deps.Allowlist.Remove(body.Remove)
+			combined.Removed = rd.Removed
+		}
+		if len(body.Add) > 0 {
+			ad := deps.Allowlist.Add(body.Add, body.Source)
+			combined.Added = ad.Added
+		}
+		sent := pushAllowlist(deps)
+		auditAllowlist(deps, r, "add/remove", combined, sent)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"commands": deps.Allowlist.Commands(), "entries": deps.Allowlist.Entries(),
+			"empty": deps.Allowlist.IsEmpty(), "added": combined.Added, "removed": combined.Removed,
+			"agentsUpdated": sent,
+		})
+	}
+}
+
+// pushAllowlist sends the current canonical list to every connected agent and
+// returns the number that received it.
+func pushAllowlist(deps Deps) int {
+	cmds := deps.Allowlist.Commands()
+	sent := 0
+	for _, clientID := range deps.Store.ClientIDs() {
+		if ws.SendSignedCommand(deps.Store, clientID, "exec_allowlist",
+			map[string]any{"commands": cmds}, deps.Log) {
+			sent++
+		}
+	}
+	return sent
+}
+
+// auditAllowlist records a mutation with the acting user and the diff.
+func auditAllowlist(deps Deps, r *http.Request, action string, d allowlist.Diff, agentsUpdated int) {
+	actor := "unknown"
+	if u := auth.UserFromContext(r.Context()); u != nil && u.Sub != "" {
+		actor = u.Sub
+	}
+	deps.Log.Info("exec allowlist mutated",
+		"actor", actor, "action", action,
+		"added", d.Added, "removed", d.Removed,
+		"total", len(deps.Allowlist.Commands()), "agentsUpdated", agentsUpdated)
+}
+
+// firstInvalidCommand returns the first entry containing forbidden shell
+// metacharacters, or ("", true) if all entries are valid.
+func firstInvalidCommand(cmds []string) (string, bool) {
+	for _, c := range cmds {
+		if strings.TrimSpace(c) != "" && !allowlist.ValidateCommand(c) {
+			return c, false
+		}
+	}
+	return "", true
 }
 
 func handleCronGet(deps Deps) http.HandlerFunc {

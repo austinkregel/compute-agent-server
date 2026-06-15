@@ -12,6 +12,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"nhooyr.io/websocket"
 
+	"github.com/austinkregel/backup-server/internal/allowlist"
 	"github.com/austinkregel/backup-server/internal/api"
 	"github.com/austinkregel/backup-server/internal/auth"
 	servercli "github.com/austinkregel/backup-server/internal/cli"
@@ -36,6 +37,7 @@ type Server struct {
 	dashboard  *ws.DashboardHandler
 	relayer    *relay.Relay
 	oidc       *auth.OIDCProvider
+	allowlist  *allowlist.Store
 
 	// EnableCLI controls whether the interactive CLI runs. Defaults to true.
 	EnableCLI bool
@@ -61,6 +63,13 @@ func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
 		s.oidc = oidcProvider
 	}
 
+	// Canonical exec allowlist (persisted; seeded from config on first run).
+	allowlistPath := os.Getenv("EXEC_ALLOWLIST_STATE_PATH")
+	if allowlistPath == "" {
+		allowlistPath = "exec-allowlist.json"
+	}
+	s.allowlist = allowlist.New(allowlistPath, cfg.ExecAllowedCommands, log)
+
 	// Agent handler
 	maxSkew := time.Duration(cfg.AgentAuthMaxSkewSec) * time.Second
 	s.agents = ws.NewAgentHandler(store, log, cfg.AuthToken, maxSkew)
@@ -76,7 +85,7 @@ func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
 		s.dashboard.BroadcastClientList()
 		// Push the canonical command allowlist to the freshly-connected agent.
 		ws.SendSignedCommand(store, clientID, "exec_allowlist",
-			map[string]any{"commands": s.cfg.ExecAllowedCommands}, log)
+			map[string]any{"commands": s.allowlist.Commands()}, log)
 	}
 	s.agents.OnDisconnect = func(clientID string) {
 		s.dashboard.BroadcastClientList()
@@ -277,10 +286,15 @@ func (s *Server) buildHandler() http.Handler {
 		Log:       s.log,
 		Config:    s.cfg,
 		Relay:     s.relayer,
+		Allowlist: s.allowlist,
 		StartTime: time.Now(),
 	}
 	if s.oidc != nil {
 		deps.AuthStatusHandler = s.oidc.HandleAuthStatus
+		deps.AdminMiddleware = s.oidc.RequireAdmin
+		if s.cfg.OIDC.AdminGroup == "" {
+			s.log.Warn("oidc.adminGroup is not set: admin endpoints (exec-allowlist, restart/shutdown) are NOT role-gated — any authenticated user can call them; set oidc.adminGroup to enforce")
+		}
 	}
 	apiRouter := api.NewRouter(deps, authMW)
 
