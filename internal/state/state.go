@@ -28,6 +28,7 @@ type ClientEntry struct {
 	Release      string
 	Hostname     string
 	Arch         string
+	Home         string
 	CPUs         string
 	AgentVersion string
 
@@ -56,6 +57,7 @@ type PublicClient struct {
 	Release       string `json:"release,omitempty"`
 	Hostname      string `json:"hostname,omitempty"`
 	Arch          string `json:"arch,omitempty"`
+	Home          string `json:"home,omitempty"`
 	CPUs          string `json:"cpus,omitempty"`
 	AgentVersion  string `json:"agentVersion,omitempty"`
 	// Direct-connection advertisement, surfaced so the IDE can attempt P2P.
@@ -217,6 +219,7 @@ func (s *Store) PublicClients() []PublicClient {
 			Release:           e.Release,
 			Hostname:          e.Hostname,
 			Arch:              e.Arch,
+			Home:              e.Home,
 			CPUs:              e.CPUs,
 			AgentVersion:      e.AgentVersion,
 			DirectAddr:        e.DirectAddr,
@@ -281,6 +284,10 @@ func (s *Store) UpdateStats(clientID string, stats map[string]any) bool {
 		}
 		if v, ok := stats["arch"].(string); ok && v != "" && v != entry.Arch {
 			entry.Arch = v
+			changed = true
+		}
+		if v, ok := stats["home"].(string); ok && v != "" && v != entry.Home {
+			entry.Home = v
 			changed = true
 		}
 		// cpus comes as a JSON number (float64 in Go)
