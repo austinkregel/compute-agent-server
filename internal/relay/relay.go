@@ -962,9 +962,13 @@ func (r *Relay) handleFileGetChunk(clientID string, data map[string]any) {
 	}
 	r.fileMu.Unlock()
 	if !ok {
+		r.log.Warn("file_get_chunk dropped: no pending op", "requestId", reqID, "clientId", clientID)
 		return
 	}
-	r.dash.SendTo(op.DashConnID, "file_get_chunk", mergeClientID(clientID, data))
+	if !r.dash.SendTo(op.DashConnID, "file_get_chunk", mergeClientID(clientID, data)) {
+		r.log.Warn("file_get_chunk dropped: dashboard connection gone",
+			"requestId", reqID, "dashConnID", op.DashConnID)
+	}
 }
 
 func (r *Relay) handleFileGetResult(clientID string, data map[string]any) {
@@ -976,9 +980,15 @@ func (r *Relay) handleFileGetResult(clientID string, data map[string]any) {
 	}
 	r.fileMu.Unlock()
 	if !ok {
+		r.log.Warn("file_get_result dropped: no pending op", "requestId", reqID, "clientId", clientID)
 		return
 	}
-	r.dash.SendTo(op.DashConnID, "file_get_result", mergeClientID(clientID, data))
+	if r.dash.SendTo(op.DashConnID, "file_get_result", mergeClientID(clientID, data)) {
+		r.log.Info("file_get relayed to dashboard", "requestId", reqID, "dashConnID", op.DashConnID, "size", data["size"])
+	} else {
+		r.log.Warn("file_get_result dropped: dashboard connection gone",
+			"requestId", reqID, "dashConnID", op.DashConnID)
+	}
 }
 
 func (r *Relay) handleFilePutChunk(dc *ws.DashboardConn, data map[string]any) {
