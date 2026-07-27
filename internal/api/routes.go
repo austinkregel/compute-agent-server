@@ -20,6 +20,7 @@ import (
 	"github.com/austinkregel/backup-server/internal/allowlist"
 	"github.com/austinkregel/backup-server/internal/auth"
 	"github.com/austinkregel/backup-server/internal/config"
+	"github.com/austinkregel/backup-server/internal/database"
 	"github.com/austinkregel/backup-server/internal/relay"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/backup-server/internal/ws"
@@ -37,6 +38,9 @@ type Deps struct {
 	Config    *config.Config
 	Relay     *relay.Relay
 	Allowlist *allowlist.Store
+	// SMS is nil if the database failed to open at startup (see server.New) —
+	// handlers must treat that as "SMS history unavailable", not panic.
+	SMS *database.SMSStore
 
 	// AuthStatusHandler is the handler for /api/auth/status.
 	// When OIDC is enabled, this should be OIDCProvider.HandleAuthStatus.
@@ -101,6 +105,14 @@ func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Ro
 			r.Get("/api/server/exec-allowlist", handleExecAllowlistGet(deps))
 			r.Put("/api/server/exec-allowlist", handleExecAllowlistPut(deps))
 			r.Post("/api/server/exec-allowlist", handleExecAllowlistPost(deps))
+
+			// SMS (phone-class agents only, gated by the "telephony" capability
+			// client-side). Admin-gated for now — per-client access scoping so
+			// not every admin can read every phone's texts is a tracked M2
+			// follow-up (see api/sms_handlers.go).
+			r.Get("/api/client/{clientId}/sms/threads", handleSMSThreads(deps))
+			r.Get("/api/client/{clientId}/sms/threads/{threadId}/messages", handleSMSMessages(deps))
+			r.Post("/api/client/{clientId}/sms/send", handleSMSSend(deps))
 		})
 
 		// Local cron

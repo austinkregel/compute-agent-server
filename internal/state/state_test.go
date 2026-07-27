@@ -119,6 +119,73 @@ func TestStore_UpdateStats_ParsesDirectAdvert(t *testing.T) {
 	}
 }
 
+func TestStore_UpdateStats_ParsesCapabilities(t *testing.T) {
+	s := New()
+	s.AddClient("node-1", nil)
+
+	changed := s.UpdateStats("node-1", map[string]any{
+		"capabilities": map[string]any{
+			"docker": map[string]any{
+				"state": "enabled",
+				"meta":  map[string]any{"version": "24.0.0"},
+			},
+			"telephony": map[string]any{
+				"state":    "unavailable",
+				"detail":   "companion socket unreachable",
+				"features": []any{"sms", "volte_bridge"},
+			},
+		},
+	})
+	if !changed {
+		t.Error("UpdateStats should report changed when capabilities first appear")
+	}
+
+	pub := s.PublicClients()
+	if len(pub) != 1 {
+		t.Fatalf("PublicClients len = %d", len(pub))
+	}
+	caps := pub[0].Capabilities
+	if caps["docker"].State != "enabled" {
+		t.Errorf("docker capability state = %q, want enabled", caps["docker"].State)
+	}
+	if caps["docker"].Meta["version"] != "24.0.0" {
+		t.Errorf("docker capability meta not surfaced: %+v", caps["docker"])
+	}
+	if caps["telephony"].State != "unavailable" || caps["telephony"].Detail != "companion socket unreachable" {
+		t.Errorf("telephony capability not parsed: %+v", caps["telephony"])
+	}
+	if len(caps["telephony"].Features) != 2 || caps["telephony"].Features[0] != "sms" {
+		t.Errorf("telephony features not parsed: %+v", caps["telephony"].Features)
+	}
+
+	// A second identical push should NOT report changed (no-op update).
+	changed = s.UpdateStats("node-1", map[string]any{
+		"capabilities": map[string]any{
+			"docker": map[string]any{
+				"state": "enabled",
+				"meta":  map[string]any{"version": "24.0.0"},
+			},
+			"telephony": map[string]any{
+				"state":    "unavailable",
+				"detail":   "companion socket unreachable",
+				"features": []any{"sms", "volte_bridge"},
+			},
+		},
+	})
+	if changed {
+		t.Error("UpdateStats should not report changed for an identical capabilities push")
+	}
+
+	// A stats push with no capabilities key at all leaves prior capabilities intact.
+	changed = s.UpdateStats("node-1", map[string]any{"cpu": float64(1)})
+	if changed {
+		t.Error("UpdateStats should not report changed when capabilities key is simply absent")
+	}
+	if s.PublicClients()[0].Capabilities["docker"].State != "enabled" {
+		t.Error("capabilities should persist across stats pushes that omit the key")
+	}
+}
+
 func TestStore_StatsHistoryBounded(t *testing.T) {
 	s := New()
 	s.AddClient("node-1", nil)

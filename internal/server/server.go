@@ -17,6 +17,7 @@ import (
 	"github.com/austinkregel/backup-server/internal/auth"
 	servercli "github.com/austinkregel/backup-server/internal/cli"
 	"github.com/austinkregel/backup-server/internal/config"
+	"github.com/austinkregel/backup-server/internal/database"
 	"github.com/austinkregel/backup-server/internal/heartbeat"
 	"github.com/austinkregel/backup-server/internal/relay"
 	"github.com/austinkregel/backup-server/internal/spa"
@@ -38,6 +39,7 @@ type Server struct {
 	relayer    *relay.Relay
 	oidc       *auth.OIDCProvider
 	allowlist  *allowlist.Store
+	sms        *database.SMSStore
 
 	// EnableCLI controls whether the interactive CLI runs. Defaults to true.
 	EnableCLI bool
@@ -70,6 +72,17 @@ func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
 	}
 	s.allowlist = allowlist.New(allowlistPath, cfg.ExecAllowedCommands, log)
 
+	// Database (currently only backs SMS history). Non-fatal if it fails to
+	// open — SMS is an optional phone-agent feature, not core to the rest of
+	// the control plane, so the server still starts without it and logs why.
+	if db, err := database.Open(cfg.DatabaseDSN); err != nil {
+		log.Error("database unavailable; SMS history will not be persisted", "dsn", cfg.DatabaseDSN, "error", err)
+	} else if key, err := database.LoadOrCreateKey(cfg.SMSEncryptionKeyFile); err != nil {
+		log.Error("sms encryption key unavailable; SMS history will not be persisted", "error", err)
+	} else {
+		s.sms = database.NewSMSStore(db, key)
+	}
+
 	// Agent handler
 	maxSkew := time.Duration(cfg.AgentAuthMaxSkewSec) * time.Second
 	s.agents = ws.NewAgentHandler(store, log, cfg.AuthToken, maxSkew)
@@ -79,6 +92,9 @@ func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
 
 	// Relay (with backup plan persistence directory)
 	s.relayer = relay.New(store, log, s.dashboard, "backups")
+	if s.sms != nil {
+		s.relayer.SetSMSStore(s.sms)
+	}
 
 	// Wire agent callbacks
 	s.agents.OnConnect = func(clientID string) {
@@ -287,6 +303,7 @@ func (s *Server) buildHandler() http.Handler {
 		Config:    s.cfg,
 		Relay:     s.relayer,
 		Allowlist: s.allowlist,
+		SMS:       s.sms,
 		StartTime: time.Now(),
 	}
 	if s.oidc != nil {

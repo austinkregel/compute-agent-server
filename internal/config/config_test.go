@@ -80,6 +80,29 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 	if len(cfg.ExecAllowedCommands) != len(DefaultExecAllowedCommands) {
 		t.Errorf("ExecAllowedCommands = %v, want defaults", cfg.ExecAllowedCommands)
 	}
+	if cfg.DatabaseDSN != "sqlite://./data/app.db" {
+		t.Errorf("DatabaseDSN = %q, want default sqlite DSN", cfg.DatabaseDSN)
+	}
+	if cfg.SMSEncryptionKeyFile != "sms-encryption.key" {
+		t.Errorf("SMSEncryptionKeyFile = %q, want default", cfg.SMSEncryptionKeyFile)
+	}
+}
+
+func TestLoad_EnvOverrideDatabaseDSN(t *testing.T) {
+	t.Setenv("DATABASE_DSN", "postgres://user:pass@localhost/db")
+	t.Setenv("SMS_ENCRYPTION_KEY_FILE", "/etc/backup-server/sms.key")
+
+	p := writeTestConfig(t, `{"port": 8443, "authToken": "secret"}`)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	if cfg.DatabaseDSN != "postgres://user:pass@localhost/db" {
+		t.Errorf("DatabaseDSN = %q, want env override", cfg.DatabaseDSN)
+	}
+	if cfg.SMSEncryptionKeyFile != "/etc/backup-server/sms.key" {
+		t.Errorf("SMSEncryptionKeyFile = %q, want env override", cfg.SMSEncryptionKeyFile)
+	}
 }
 
 func TestLoad_ExecAllowlistEnvOverride(t *testing.T) {

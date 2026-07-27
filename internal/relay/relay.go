@@ -1,6 +1,8 @@
 package relay
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -12,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/austinkregel/backup-server/internal/database"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/backup-server/internal/ws"
 	"github.com/austinkregel/compute-agent/pkg/logging"
@@ -97,6 +100,16 @@ type Relay struct {
 	// Generic pending responses: token → channel for arbitrary JSON results
 	genericMu      sync.Mutex
 	genericPending map[string]chan map[string]any
+
+	// sms persists SMS threads/messages (nil until SetSMSStore is called —
+	// only wired when the server has a working database connection).
+	sms *database.SMSStore
+}
+
+// SetSMSStore wires SMS persistence. Nil-safe to skip calling: sms_received
+// events are simply broadcast without being persisted if unset.
+func (r *Relay) SetSMSStore(store *database.SMSStore) {
+	r.sms = store
 }
 
 type shellSession struct {
@@ -447,7 +460,75 @@ func (r *Relay) HandleAgentEvent(clientID string, msg *ws.Message) {
 			r.ResolveGenericPending(token, merged)
 		}
 		r.dash.Broadcast(msg.Event, merged)
+
+	// Incoming SMS pushed live from the companion app. Persisted here (not by
+	// the REST layer, since there's no REST request in flight for a push) and
+	// then broadcast so any open dashboard updates immediately.
+	case "sms_received":
+		r.handleSMSReceived(clientID, data)
+
+	// Outbound send result: the REST handler that issued sms_send already has
+	// (to, body) in scope and does its own persistence before responding, so
+	// this just resolves that pending request and mirrors it to other
+	// dashboards that might have the same thread open.
+	case "sms_send_result":
+		merged := mergeClientID(clientID, data)
+		if token, ok := data["token"].(string); ok && token != "" {
+			r.ResolveGenericPending(token, merged)
+		}
+		r.dash.Broadcast(msg.Event, merged)
+
+	// Reserved for M2's reconnect-reconciliation flow (pulling full thread/
+	// message history from the phone's native SMS store) — no REST caller
+	// registers a pending token for these yet, so today this only reaches
+	// dashboards that happen to be listening for it directly.
+	case "sms_thread_response", "sms_messages_response":
+		merged := mergeClientID(clientID, data)
+		if token, ok := data["token"].(string); ok && token != "" {
+			r.ResolveGenericPending(token, merged)
+		}
+		r.dash.Broadcast(msg.Event, merged)
 	}
+}
+
+// handleSMSReceived persists an incoming SMS (if a database is configured)
+// and broadcasts it to dashboards either way — persistence is best-effort,
+// never a reason to drop the live notification.
+func (r *Relay) handleSMSReceived(clientID string, data map[string]any) {
+	address, _ := data["address"].(string)
+	body, _ := data["body"].(string)
+	tsRaw, _ := data["ts"].(float64)
+
+	ts := time.Now().UTC()
+	if tsRaw > 0 {
+		ts = time.UnixMilli(int64(tsRaw)).UTC()
+	}
+
+	if r.sms != nil && address != "" {
+		threadID, err := r.sms.UpsertThread(clientID, address, body, ts, true)
+		if err != nil {
+			r.log.Warn("failed to upsert sms thread", "clientId", clientID, "error", err)
+		} else {
+			// Companion pushes for incoming SMS don't carry a messageId (unlike
+			// sends, which get one from the companion's SmsManager call), so
+			// derive a stable dedup key from the message's own content —
+			// a redelivered push for the exact same message becomes a no-op
+			// instead of a duplicate row.
+			remoteID := smsInboundDedupKey(clientID, address, body, ts)
+			if _, err := r.sms.InsertMessage(clientID, threadID, remoteID, address, "in", body, "received", ts); err != nil {
+				r.log.Warn("failed to persist incoming sms", "clientId", clientID, "error", err)
+			}
+		}
+	}
+
+	r.dash.Broadcast("sms_received", mergeClientID(clientID, data))
+}
+
+// smsInboundDedupKey derives a stable identifier for an incoming SMS that
+// didn't arrive with its own message ID.
+func smsInboundDedupKey(clientID, address, body string, ts time.Time) string {
+	h := sha256.Sum256([]byte(clientID + "|" + address + "|" + body + "|" + ts.Format(time.RFC3339Nano)))
+	return "in-" + hex.EncodeToString(h[:16])
 }
 
 // CleanupDashboard removes all sessions owned by a disconnected dashboard.

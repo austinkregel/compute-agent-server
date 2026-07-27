@@ -27,6 +27,16 @@ type Config struct {
 	// (governs exec + admin_run). Managed centrally here, not per-agent.
 	ExecAllowedCommands []string `json:"execAllowedCommands"`
 
+	// DatabaseDSN is the persistence backend for features that need it (SMS
+	// history today). "sqlite://path" or "postgres://..."/"postgresql://...".
+	DatabaseDSN string `json:"databaseDsn"`
+	// SMSEncryptionKeyFile stores the AES-256 key used to encrypt SMS bodies
+	// at rest, generated on first run if it doesn't exist (see
+	// internal/database.LoadOrCreateKey). Keep this out of version control
+	// and backups of the config file — it's the only thing standing between
+	// a DB leak and readable message content.
+	SMSEncryptionKeyFile string `json:"smsEncryptionKeyFile"`
+
 	OIDC    OIDCConfig    `json:"oidc"`
 	Logging LoggingConfig `json:"logging"`
 }
@@ -157,6 +167,12 @@ func (c *Config) applyDefaults() {
 	if len(c.ExecAllowedCommands) == 0 {
 		c.ExecAllowedCommands = append([]string(nil), DefaultExecAllowedCommands...)
 	}
+	if c.DatabaseDSN == "" {
+		c.DatabaseDSN = "sqlite://./data/app.db"
+	}
+	if c.SMSEncryptionKeyFile == "" {
+		c.SMSEncryptionKeyFile = "sms-encryption.key"
+	}
 }
 
 func (c *Config) applyEnvOverrides() {
@@ -187,6 +203,12 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("VERSION_RELEASE_WEBHOOK_SECRET"); v != "" {
 		c.VersionReleaseWebhookSecret = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("DATABASE_DSN"); v != "" {
+		c.DatabaseDSN = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("SMS_ENCRYPTION_KEY_FILE"); v != "" {
+		c.SMSEncryptionKeyFile = strings.TrimSpace(v)
 	}
 
 	// OIDC env overrides

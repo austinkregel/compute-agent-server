@@ -2,6 +2,7 @@ package state
 
 import (
 	"fmt"
+	"reflect"
 	"sync"
 	"time"
 
@@ -43,6 +44,23 @@ type ClientEntry struct {
 	// Signer is kept as an opaque interface to avoid import cycles.
 	// The ws package will type-assert as needed.
 	Signer any
+
+	// Capabilities is the agent's self-reported capability registry snapshot
+	// (from stats.capabilities), keyed by capability name (e.g. "docker",
+	// "battery", "telephony"). Populated generically — new capabilities never
+	// require a server code change.
+	Capabilities map[string]CapabilityInfo
+}
+
+// CapabilityInfo mirrors the agent's capability.Info wire shape: a tri-state
+// availability signal plus optional detail/features/metadata. See
+// agent/pkg/capability for the authoritative definition.
+type CapabilityInfo struct {
+	State     string         `json:"state"`
+	Detail    string         `json:"detail,omitempty"`
+	Features  []string       `json:"features,omitempty"`
+	Meta      map[string]any `json:"meta,omitempty"`
+	LastProbe string         `json:"lastProbe,omitempty"`
 }
 
 // PublicClient is the JSON-safe projection of a ClientEntry.
@@ -64,6 +82,9 @@ type PublicClient struct {
 	DirectAddr        string `json:"directAddr,omitempty"`
 	DirectCertSHA256  string `json:"directCertSha256,omitempty"`
 	DirectPinRequired bool   `json:"directPinRequired,omitempty"`
+	// Capabilities is the agent's self-reported capability snapshot, keyed by
+	// capability name. See CapabilityInfo.
+	Capabilities map[string]CapabilityInfo `json:"capabilities,omitempty"`
 }
 
 // ShellSession tracks an active PTY relay.
@@ -225,6 +246,7 @@ func (s *Store) PublicClients() []PublicClient {
 			DirectAddr:        e.DirectAddr,
 			DirectCertSHA256:  e.DirectCertSHA256,
 			DirectPinRequired: e.DirectPinRequired,
+			Capabilities:      e.Capabilities,
 		}
 		e.Mu.Unlock()
 		out = append(out, pub)
@@ -327,9 +349,50 @@ func (s *Store) UpdateStats(clientID string, stats map[string]any) bool {
 			entry.DirectPinRequired = pinReq
 			changed = true
 		}
+
+		// Capability-registry snapshot (stats.capabilities). Parsed generically —
+		// unlike the fields above, this never needs a new hardcoded block when a
+		// new capability (e.g. "telephony") is introduced on the agent side.
+		if capsRaw, ok := stats["capabilities"].(map[string]any); ok {
+			parsed := parseCapabilities(capsRaw)
+			if !reflect.DeepEqual(parsed, entry.Capabilities) {
+				entry.Capabilities = parsed
+				changed = true
+			}
+		}
 		entry.Mu.Unlock()
 	}
 	return changed
+}
+
+// parseCapabilities defensively converts the raw stats.capabilities map (as
+// decoded from JSON into map[string]any) into typed CapabilityInfo entries.
+// Unknown/malformed entries are skipped rather than erroring, matching this
+// package's convention of degrading gracefully on unexpected agent payloads.
+func parseCapabilities(raw map[string]any) map[string]CapabilityInfo {
+	out := make(map[string]CapabilityInfo, len(raw))
+	for name, v := range raw {
+		m, ok := v.(map[string]any)
+		if !ok {
+			continue
+		}
+		info := CapabilityInfo{}
+		info.State, _ = m["state"].(string)
+		info.Detail, _ = m["detail"].(string)
+		info.LastProbe, _ = m["lastProbe"].(string)
+		if featuresRaw, ok := m["features"].([]any); ok {
+			for _, f := range featuresRaw {
+				if s, ok := f.(string); ok {
+					info.Features = append(info.Features, s)
+				}
+			}
+		}
+		if meta, ok := m["meta"].(map[string]any); ok {
+			info.Meta = meta
+		}
+		out[name] = info
+	}
+	return out
 }
 
 // GetStats returns the latest cached stats for a client.
