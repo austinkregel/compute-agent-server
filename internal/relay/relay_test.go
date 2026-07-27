@@ -534,13 +534,16 @@ func TestFilePutResult_RoutedToOwner(t *testing.T) {
 	}
 	r.fileMu.RUnlock()
 
+	// A put emits two result frames. The first (accept, after start) is forwarded
+	// but must NOT retire the op — deleting it here would drop the final frame and
+	// hang the uploader at file_put_finish.
 	r.HandleAgentEvent("node-1", makeMsg("file_put_result", map[string]any{
 		"requestId": reqID, "ok": true, "path": "/tmp/test.txt",
 	}))
 
 	msg := md.findSent("dash-1", "file_put_result")
 	if msg == nil {
-		t.Fatal("file_put_result not sent to dash-1")
+		t.Fatal("accept file_put_result not sent to dash-1")
 	}
 	if msg.Data["ok"] != true {
 		t.Errorf("ok = %v", msg.Data["ok"])
@@ -549,8 +552,55 @@ func TestFilePutResult_RoutedToOwner(t *testing.T) {
 	r.fileMu.RLock()
 	count := len(r.fileOps)
 	r.fileMu.RUnlock()
+	if count != 1 {
+		t.Fatalf("file ops = %d after accept frame, want 1 (op must survive until finish)", count)
+	}
+
+	// finish marks the op terminal; the final result then retires it.
+	r.HandleDashboardEvent(dc, makeMsg("file_put_finish", map[string]any{
+		"clientId": "node-1", "requestId": reqID,
+	}))
+	r.HandleAgentEvent("node-1", makeMsg("file_put_result", map[string]any{
+		"requestId": reqID, "ok": true, "path": "/tmp/test.txt", "size": 4,
+	}))
+
+	r.fileMu.RLock()
+	count = len(r.fileOps)
+	r.fileMu.RUnlock()
 	if count != 0 {
-		t.Errorf("file ops = %d after result, want 0", count)
+		t.Errorf("file ops = %d after final result, want 0", count)
+	}
+}
+
+// A failure result (ok:false) — a rejected start or a chunk error — is terminal
+// and retires the op immediately, without waiting for a finish that never comes.
+func TestFilePutResult_FailureRetiresOp(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_put_start", map[string]any{
+		"clientId": "node-1", "path": "/tmp/test.txt",
+	}))
+	r.fileMu.RLock()
+	var reqID string
+	for id := range r.fileOps {
+		reqID = id
+	}
+	r.fileMu.RUnlock()
+
+	r.HandleAgentEvent("node-1", makeMsg("file_put_result", map[string]any{
+		"requestId": reqID, "ok": false, "error": "disk full",
+	}))
+
+	if msg := md.findSent("dash-1", "file_put_result"); msg == nil {
+		t.Fatal("failure file_put_result not sent to dash-1")
+	}
+	r.fileMu.RLock()
+	count := len(r.fileOps)
+	r.fileMu.RUnlock()
+	if count != 0 {
+		t.Errorf("file ops = %d after failure, want 0", count)
 	}
 }
 

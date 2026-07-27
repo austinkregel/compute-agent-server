@@ -130,6 +130,11 @@ type fileOp struct {
 	RequestID  string
 	StartedAt  time.Time
 	LastSeenAt time.Time
+	// Finishing marks a put whose file_put_finish has been relayed to the agent.
+	// A put emits two file_put_result frames — an accept (after start) and a
+	// final (after finish) — so the op must survive the accept and only be
+	// retired on the final/error frame.
+	Finishing bool
 }
 
 type adminResult struct {
@@ -259,6 +264,8 @@ func (r *Relay) HandleDashboardEvent(dc *ws.DashboardConn, msg *ws.Message) {
 	// Generic command exec
 	case "exec_request":
 		r.handleExecRequest(dc, data)
+	case "exec_cancel":
+		r.handleExecCancel(dc, data)
 
 	// Kiosk
 	case "kiosk_set":
@@ -1015,16 +1022,37 @@ func (r *Relay) handleFilePutFinish(dc *ws.DashboardConn, data map[string]any) {
 	clientID := str(data, "clientId")
 	reqID := str(data, "requestId")
 
+	// Mark the op as finishing so the next file_put_result (the final frame)
+	// is treated as terminal and retires the op.
+	r.fileMu.Lock()
+	if op, ok := r.fileOps[reqID]; ok {
+		op.Finishing = true
+		op.LastSeenAt = time.Now()
+	}
+	r.fileMu.Unlock()
+
 	ws.SendSignedCommand(r.store, clientID, "file_put_finish",
 		map[string]any{"requestId": reqID, "checksum": data["checksum"]}, r.log)
 }
 
 func (r *Relay) handleFilePutResult(clientID string, data map[string]any) {
 	reqID := str(data, "requestId")
+	// A put emits two result frames: an accept (after start) and a final (after
+	// finish). The op is retired only on a terminal frame — a failure (ok:false,
+	// from a rejected start or a chunk error) or the post-finish result. Deleting
+	// on the accept frame would drop the final frame and hang the uploader.
+	terminal := !boolVal(data, "ok")
 	r.fileMu.Lock()
 	op, ok := r.fileOps[reqID]
 	if ok {
-		delete(r.fileOps, reqID)
+		if op.Finishing {
+			terminal = true
+		}
+		if terminal {
+			delete(r.fileOps, reqID)
+		} else {
+			op.LastSeenAt = time.Now()
+		}
 	}
 	r.fileMu.Unlock()
 	if !ok {
@@ -1311,6 +1339,19 @@ func (r *Relay) handleExecRequest(dc *ws.DashboardConn, data map[string]any) {
 		"clientId":  clientID,
 		"requestId": reqID,
 	})
+}
+
+// handleExecCancel forwards a fire-and-forget cancel for an in-flight exec to the
+// agent, which kills the running process. The result still arrives via the
+// original exec_result, so nothing to route back here.
+func (r *Relay) handleExecCancel(_ *ws.DashboardConn, data map[string]any) {
+	clientID := str(data, "clientId")
+	if clientID == "" || !r.store.HasClient(clientID) {
+		return
+	}
+	ws.SendSignedCommand(r.store, clientID, "exec_cancel", map[string]any{
+		"requestId": str(data, "requestId"),
+	}, r.log)
 }
 
 func (r *Relay) handleExecResult(clientID string, data map[string]any) {
