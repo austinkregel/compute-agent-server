@@ -60,7 +60,7 @@ dev:
 
 .PHONY: client
 client:
-	cd ../client && npm run build
+	cd client && npm run build
 
 # ---------- Docker ----------
 

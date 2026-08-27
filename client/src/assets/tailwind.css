@@ -1,0 +1,11 @@
+@import "tailwindcss";
+@import 'xterm/css/xterm.css';
+@font-face {
+  font-family: 'Hack';
+  src: url('hack-regular.woff2?sha=3114f1256') format('woff2'), url('hack-regular.woff?sha=3114f1256') format('woff');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+.xterm .xterm-rows, .font-hack { font-family: 'Hack' !important; }
