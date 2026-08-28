@@ -33,4 +33,8 @@ COPY --from=client-build /src/client/dist /app/client/dist
 # resolved relative to CWD by the binary itself; mount them here as needed.
 VOLUME ["/app/data", "/app/certs"]
 EXPOSE 8443
+# Re-invokes this same binary (--healthcheck) rather than shelling out — the
+# distroless base has no shell/curl for a traditional `CMD curl ...` probe.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/app/backup-server", "--healthcheck"]
 ENTRYPOINT ["/app/backup-server"]

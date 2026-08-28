@@ -37,6 +37,26 @@ type Config struct {
 	// a DB leak and readable message content.
 	SMSEncryptionKeyFile string `json:"smsEncryptionKeyFile"`
 
+	// TLSDomain is the public hostname this server presents on its TLS
+	// listener and registers with Traefik (e.g. monitor.kratos.kregel.dev).
+	// Empty disables the Traefik cert-sync/self-registration integration
+	// below entirely; the server falls back to whatever's in certDir already.
+	TLSDomain string `json:"tlsDomain"`
+	// TraefikACMEPath points at a (read-only mounted) Traefik acme.json. When
+	// set alongside TLSDomain, the server extracts TLSDomain's cert/key from
+	// it into certDir and keeps them in sync as Traefik renews. See
+	// internal/traefikcert.
+	TraefikACMEPath string `json:"traefikAcmePath"`
+	// TraefikDynamicDir points at a (read-write mounted) Traefik file-provider
+	// directory. When set alongside TLSDomain, the server writes its own
+	// router/service config there on startup so Traefik requests a cert for
+	// TLSDomain and proxies to TraefikBackendURL. See internal/traefikroute.
+	TraefikDynamicDir string `json:"traefikDynamicDir"`
+	// TraefikBackendURL is the address Traefik should proxy TLSDomain traffic
+	// to (e.g. https://10.0.1.1:8443 — the Docker network gateway reaching
+	// this host). Only used when TraefikDynamicDir is set.
+	TraefikBackendURL string `json:"traefikBackendUrl"`
+
 	OIDC    OIDCConfig    `json:"oidc"`
 	Logging LoggingConfig `json:"logging"`
 }
@@ -184,6 +204,34 @@ func (c *Config) applyEnvOverrides() {
 	if v := os.Getenv("AUTH_TOKEN"); v != "" {
 		c.AuthToken = strings.TrimSpace(v)
 	}
+	if v := os.Getenv("SERVER_URL"); v != "" {
+		c.ServerURL = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("PING_INTERVAL_SEC"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			c.PingIntervalSec = n
+		}
+	}
+	if v := os.Getenv("PONG_TIMEOUT_SEC"); v != "" {
+		if n, err := strconv.Atoi(strings.TrimSpace(v)); err == nil {
+			c.PongTimeoutSec = n
+		}
+	}
+	if v := os.Getenv("DASHBOARD_ALLOWED_ORIGINS"); v != "" {
+		var origins []string
+		for _, part := range strings.Split(v, ",") {
+			if p := strings.TrimSpace(part); p != "" {
+				origins = append(origins, p)
+			}
+		}
+		c.DashboardAllowedOrigins = origins
+	}
+	if v := os.Getenv("LOG_FILE"); v != "" {
+		c.LogFile = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("LOG_LEVEL"); v != "" {
+		c.Logging.Level = strings.TrimSpace(v)
+	}
 	if v := os.Getenv("EXEC_ALLOWED_COMMANDS"); v != "" {
 		var cmds []string
 		for _, part := range strings.Split(v, ",") {
@@ -209,6 +257,18 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("SMS_ENCRYPTION_KEY_FILE"); v != "" {
 		c.SMSEncryptionKeyFile = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("TLS_DOMAIN"); v != "" {
+		c.TLSDomain = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("TRAEFIK_ACME_PATH"); v != "" {
+		c.TraefikACMEPath = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("TRAEFIK_DYNAMIC_DIR"); v != "" {
+		c.TraefikDynamicDir = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("TRAEFIK_BACKEND_URL"); v != "" {
+		c.TraefikBackendURL = strings.TrimSpace(v)
 	}
 
 	// OIDC env overrides

@@ -41,7 +41,7 @@ func TestNew_NoOIDC(t *testing.T) {
 	cfg := minimalConfig()
 	log := testLogger(t)
 
-	srv, err := New(cfg, log)
+	srv, err := New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -68,7 +68,7 @@ func TestRun_ListensAndShutdown(t *testing.T) {
 
 	log := testLogger(t)
 
-	srv, err := New(cfg, log)
+	srv, err := New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -80,7 +80,7 @@ func TestRun_ListensAndShutdown(t *testing.T) {
 	cfg.Port = findFreePort(t)
 
 	// Recreate with the correct port
-	srv, err = New(cfg, log)
+	srv, err = New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestRun_AgentWebSocket(t *testing.T) {
 
 	log := testLogger(t)
 
-	srv, err := New(cfg, log)
+	srv, err := New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -175,7 +175,7 @@ func TestHeartbeatAdapters(t *testing.T) {
 	cfg := minimalConfig()
 	log := testLogger(t)
 
-	srv, err := New(cfg, log)
+	srv, err := New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -204,7 +204,7 @@ func TestCLIAdapters(t *testing.T) {
 	cfg := minimalConfig()
 	log := testLogger(t)
 
-	srv, err := New(cfg, log)
+	srv, err := New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}
@@ -251,7 +251,7 @@ func TestRun_StatsRetrievalAPI(t *testing.T) {
 
 	log := testLogger(t)
 
-	srv, err := New(cfg, log)
+	srv, err := New(context.Background(), cfg, log)
 	if err != nil {
 		t.Fatalf("New() error: %v", err)
 	}

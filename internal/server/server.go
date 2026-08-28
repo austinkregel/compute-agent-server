@@ -23,6 +23,8 @@ import (
 	"github.com/austinkregel/backup-server/internal/spa"
 	"github.com/austinkregel/backup-server/internal/state"
 	tlspkg "github.com/austinkregel/backup-server/internal/tls"
+	"github.com/austinkregel/backup-server/internal/traefikcert"
+	"github.com/austinkregel/backup-server/internal/traefikroute"
 	"github.com/austinkregel/backup-server/internal/ws"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
@@ -46,7 +48,7 @@ type Server struct {
 }
 
 // New constructs a fully wired Server. It does not start listening.
-func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
+func New(ctx context.Context, cfg *config.Config, log *logging.Logger) (*Server, error) {
 	store := state.New()
 
 	s := &Server{
@@ -56,9 +58,22 @@ func New(cfg *config.Config, log *logging.Logger) (*Server, error) {
 		EnableCLI: true,
 	}
 
-	// OIDC (optional)
+	// OIDC (optional). Retried with backoff — a dependency like an OIDC
+	// provider deployed alongside this server may not be reachable yet on
+	// first boot (e.g. still starting up), and failing instantly here used
+	// to crash-loop hammering it every ~1s. Still fails loudly if it never
+	// comes up within the budget, surfacing genuinely broken config.
 	if cfg.OIDC.Enabled {
-		oidcProvider, err := auth.NewOIDCProvider(context.Background(), cfg.OIDC, log)
+		var oidcProvider *auth.OIDCProvider
+		err := retryWithBackoff(ctx, time.Second, 30*time.Second, 5*time.Minute, func() error {
+			p, err := auth.NewOIDCProvider(ctx, cfg.OIDC, log)
+			if err != nil {
+				log.Warn("oidc discovery failed, retrying", "error", err)
+				return err
+			}
+			oidcProvider = p
+			return nil
+		})
 		if err != nil {
 			return nil, fmt.Errorf("oidc init: %w", err)
 		}
@@ -199,6 +214,28 @@ func (s *Server) Run(ctx context.Context) error {
 
 	// TLS setup (optional — use certs if present, with auto-reload)
 	certDir := "certs"
+
+	// Traefik integration (optional — no-op unless TLSDomain is configured).
+	// Self-register a route so Traefik requests/renews a cert for TLSDomain,
+	// and keep certDir synced from Traefik's ACME store as it does. Neither
+	// step is fatal to startup — this server runs fine without Traefik.
+	if s.cfg.TraefikDynamicDir != "" && s.cfg.TLSDomain != "" {
+		if err := traefikroute.WriteRouterConfig(s.cfg.TraefikDynamicDir, s.cfg.TLSDomain, s.cfg.TraefikBackendURL); err != nil {
+			s.log.Warn("traefik route registration failed", "domain", s.cfg.TLSDomain, "error", err)
+		} else {
+			s.log.Info("traefik route registered", "domain", s.cfg.TLSDomain)
+		}
+	}
+	var cancelTraefikCertWatch func()
+	if s.cfg.TraefikACMEPath != "" && s.cfg.TLSDomain != "" {
+		cancel, err := traefikcert.WatchAndSync(s.cfg.TraefikACMEPath, s.cfg.TLSDomain, certDir, s.log)
+		if err != nil {
+			s.log.Warn("traefik cert watcher failed to start", "domain", s.cfg.TLSDomain, "error", err)
+		} else {
+			cancelTraefikCertWatch = cancel
+		}
+	}
+
 	var cancelTLSWatch func()
 	if tlspkg.CertDirExists(certDir) {
 		tlsCfg, cancel, err := tlspkg.NewTLSConfigWithWatcher(certDir, s.log)
@@ -269,6 +306,9 @@ func (s *Server) Run(ctx context.Context) error {
 	// Stop TLS cert watcher if running
 	if cancelTLSWatch != nil {
 		cancelTLSWatch()
+	}
+	if cancelTraefikCertWatch != nil {
+		cancelTraefikCertWatch()
 	}
 
 	// Graceful shutdown: stop accepting, drain with timeout
@@ -493,4 +533,37 @@ func (a *cliStoreAdapter) HasClient(clientID string) bool {
 
 func (a *cliStoreAdapter) SendCommand(clientID, event string, payload any) bool {
 	return ws.SendSignedCommand(a.store, clientID, event, payload, a.log)
+}
+
+// retryWithBackoff calls attempt until it succeeds, ctx is cancelled, or
+// budget elapses since the first attempt — whichever comes first. Delay
+// between attempts starts at initial and doubles each time, capped at max.
+// Returns the last error from attempt on budget exhaustion, or ctx.Err() if
+// cancelled while waiting.
+func retryWithBackoff(ctx context.Context, initial, max, budget time.Duration, attempt func() error) error {
+	deadline := time.Now().Add(budget)
+	delay := initial
+
+	for {
+		err := attempt()
+		if err == nil {
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return err
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return ctx.Err()
+		case <-timer.C:
+		}
+
+		delay *= 2
+		if delay > max {
+			delay = max
+		}
+	}
 }

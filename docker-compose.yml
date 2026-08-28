@@ -1,11 +1,30 @@
 # Standalone run of the containerized backup-server (server/ + server/client/
-# built into ghcr.io/austinkregel/compute-agent-server). Not wired to Traefik
-# yet — that lands separately once this image is proven out.
+# built into ghcr.io/austinkregel/compute-agent-server).
 #
 # Build locally:  docker compose -f server/docker-compose.yml build
 # Run:            docker compose -f server/docker-compose.yml up -d
 # Config:         copy server/server-example.json -> server/server-config.json
 #                 (gitignored) and fill it in before starting.
+#
+# Traefik TLS integration (internal/traefikcert, internal/traefikroute) is
+# opt-in via server-config.json: set tlsDomain, traefikAcmePath
+# (/traefik-acme/acme.json below), traefikDynamicDir (/traefik-dynamic
+# below), and traefikBackendUrl (the address Traefik should proxy tlsDomain
+# to — e.g. the Docker network gateway that reaches this host). Leave those
+# unset to run without any Traefik dependency. homelab-traefik-certs and
+# homelab-traefik-dynamic are owned by the Traefik deployment (homelab-in-a-
+# box), not this compose file — hence external: true.
+#
+# network_mode: host — matches the previous bare-metal deployment's network
+# behavior exactly. Local DNS (Pi-hole, part of the `homelab` stack) resolves
+# some same-host services (e.g. aut.hair, the OIDC provider) to 127.0.0.1,
+# meaning "reach this via the host's own Traefik on :443" — that only works
+# if 127.0.0.1 inside the container really is the host. Bridge networking
+# breaks that (127.0.0.1 becomes the container's own loopback instead), so
+# this container intentionally skips network isolation rather than special-
+# casing every hostname that resolves that way. `ports:` is omitted because
+# host networking makes it a no-op — the binary binds directly to the host's
+# 8443 (from server-config.json), same as the bare-metal process did.
 
 services:
   backup-server:
@@ -15,15 +34,24 @@ services:
     image: ghcr.io/austinkregel/compute-agent-server:latest
     container_name: backup-server
     restart: unless-stopped
-    ports:
-      - "8443:8443"
+    network_mode: host
     volumes:
       - ./server-config.json:/app/server-config.json:ro
       - backup-server-data:/app/data
       # Optional: mount a cert/key pair here to enable TLS (fullchain.pem +
-      # privkey.pem) — the server falls back to plain HTTP if absent.
+      # privkey.pem) — the server falls back to plain HTTP if absent. Also
+      # where internal/traefikcert writes certs extracted from Traefik.
       - backup-server-certs:/app/certs
+      # Traefik's ACME store (read-only) and file-provider dynamic-config dir
+      # (read-write, for self-registration) — see comment above. Both no-op
+      # unless tlsDomain is also set in server-config.json.
+      - homelab-traefik-certs:/traefik-acme:ro
+      - homelab-traefik-dynamic:/traefik-dynamic
 
 volumes:
   backup-server-data:
   backup-server-certs:
+  homelab-traefik-certs:
+    external: true
+  homelab-traefik-dynamic:
+    external: true
