@@ -66,7 +66,7 @@ client:
 
 .PHONY: docker
 docker:
-	docker build -t backup-server -f Dockerfile ..
+	docker build -t backup-server -f Dockerfile .
 
 # ---------- Clean ----------
 

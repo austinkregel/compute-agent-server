@@ -1,0 +1,35 @@
+# Prevent secrets (auth tokens, local db/logs) and build output from being
+# copied into image layers — everything here is rebuilt or mounted at runtime.
+
+.git
+.gitignore
+.env
+
+node_modules
+npm-debug.log*
+
+# Local runtime artifacts
+server-config.json
+config.json
+*.db
+*.log
+certificates/
+certs/
+
+# Build output — rebuilt inside the image
+dist
+client/dist
+
+# Tests & dev tooling
+vitest.config.*
+client/vitest.config.*
+client/tests
+*.test.*
+coverage.out
+coverage.html
+
+# Misc
+Dockerfile*
+.dockerignore
+docker-compose.*
+README*

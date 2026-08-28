@@ -1,3 +1,5 @@
+github.com/austinkregel/compute-agent v0.0.47 h1:usTbCNPssSMZSReRWSYFzi5aLBfEWPjVmBSwgT8Tvx8=
+github.com/austinkregel/compute-agent v0.0.47/go.mod h1:1Iahfwg/VZ3VUJEcAe4rzWL0H531dqQbyGwXd1yU4pI=
 github.com/coreos/go-oidc/v3 v3.17.0 h1:hWBGaQfbi0iVviX4ibC7bk8OKT5qNr4klBaCHVNvehc=
 github.com/coreos/go-oidc/v3 v3.17.0/go.mod h1:wqPbKFrVnE90vty060SB40FCJ8fTHTxSwyXJqZH+sI8=
 github.com/davecgh/go-spew v1.1.0/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=

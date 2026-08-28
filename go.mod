@@ -3,7 +3,7 @@ module github.com/austinkregel/backup-server
 go 1.25.0
 
 require (
-	github.com/austinkregel/compute-agent v0.0.0
+	github.com/austinkregel/compute-agent v0.0.47
 	github.com/coreos/go-oidc/v3 v3.17.0
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/glebarez/sqlite v1.11.0
@@ -38,5 +38,3 @@ require (
 	modernc.org/memory v1.5.0 // indirect
 	modernc.org/sqlite v1.23.1 // indirect
 )
-
-replace github.com/austinkregel/compute-agent => ../agent

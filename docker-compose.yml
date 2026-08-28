@@ -4,21 +4,21 @@
 #
 # Build locally:  docker compose -f server/docker-compose.yml build
 # Run:            docker compose -f server/docker-compose.yml up -d
-# Config:         copy server/server-example.json -> server-config.json (repo root,
-#                 gitignored) and fill it in before starting.
+# Config:         copy server/server-example.json -> server/server-config.json
+#                 (gitignored) and fill it in before starting.
 
 services:
   backup-server:
     build:
-      context: ..
-      dockerfile: server/Dockerfile
+      context: .
+      dockerfile: Dockerfile
     image: ghcr.io/austinkregel/compute-agent-server:latest
     container_name: backup-server
     restart: unless-stopped
     ports:
       - "8443:8443"
     volumes:
-      - ../server-config.json:/app/server-config.json:ro
+      - ./server-config.json:/app/server-config.json:ro
       - backup-server-data:/app/data
       # Optional: mount a cert/key pair here to enable TLS (fullchain.pem +
       # privkey.pem) — the server falls back to plain HTTP if absent.
