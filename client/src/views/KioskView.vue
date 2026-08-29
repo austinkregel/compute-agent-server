@@ -2,6 +2,7 @@
 import { ref, computed, reactive, onMounted, onUnmounted, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import { send, on as onWS, kioskStatusMap, variantStatusMap, kioskLayoutsMap } from '../lib/sharedWS.js';
+import { isAdmin } from '../lib/auth.js';
 
 const route = useRoute();
 const clientId = computed(() => String(route.params.clientId || ''));
@@ -33,6 +34,18 @@ const widgets = ref([]);
 const units = ref('imperial');
 const saving = ref(false);
 const applying = ref(false);
+// Last write failure reported by the server or agent. Save/Apply are
+// admin-gated in the relay (kiosk_get_layouts is not), so a non-admin session
+// loads the editor normally and has every write refused; surface that rather
+// than letting the button report a success it never observed.
+const writeError = ref('');
+const writeOk = ref('');
+const writeTimers = [];
+// 'pending' = no reply from the agent yet, 'agent' = loaded from the agent's
+// store, 'default' = agent has no such layout and this is a local default.
+const layoutSource = ref('pending');
+// Whether kioskLayoutsMap holds a real reply from this agent yet.
+const layoutsLoaded = computed(() => !!kioskLayoutsMap[clientId.value]);
 const showPalette = ref(false);
 const showKioskMessageModal = ref(false);
 const showKioskUrlModal = ref(false);
@@ -92,9 +105,14 @@ function loadLayoutFromStore(name) {
     gridRows.value = l.rows || gridRows.value;
     widgets.value = (l.widgets || []).map(w => ({ ...w }));
     if (l.units) units.value = l.units;
-  } else {
-    loadDefaultLayout(name);
+    layoutSource.value = 'agent';
+    return;
   }
+  // No layout of this name on the agent. Fall back to the built-in shape so the
+  // editor is usable, but record that this is NOT the agent's state — otherwise
+  // a client-side default is indistinguishable from persisted data.
+  loadDefaultLayout(name);
+  layoutSource.value = layouts ? 'default' : 'pending';
 }
 
 function loadDefaultLayout(name) {
@@ -294,6 +312,8 @@ function isCellEmpty(col, row) {
 function saveLayout() {
   if (!clientId.value) return;
   saving.value = true;
+  writeError.value = '';
+  writeOk.value = '';
   send({
     type: 'kiosk_save_layout',
     clientId: clientId.value,
@@ -303,18 +323,32 @@ function saveLayout() {
     widgets: widgets.value.map(w => ({ type: w.type, col: w.col, row: w.row, w: w.w, h: w.h, config: w.config })),
     units: units.value,
   });
-  setTimeout(() => { saving.value = false; }, 1500);
+  // Cleared by the kiosk_layout_saved ack (or an error event), not a timer.
+  // The timeout only reports that no answer arrived at all.
+  armWriteTimeout(saving, 'Save');
 }
 
 function applyLayout() {
   if (!clientId.value) return;
   applying.value = true;
+  writeError.value = '';
+  writeOk.value = '';
   send({
     type: 'kiosk_set',
     clientId: clientId.value,
     content: { kind: 'page', layout: currentPreset.value, units: units.value },
   });
-  setTimeout(() => { applying.value = false; }, 1500);
+  armWriteTimeout(applying, 'Apply');
+}
+
+// A write that draws neither an ack nor an error is itself a failure state.
+function armWriteTimeout(flag, label) {
+  const timer = setTimeout(() => {
+    if (!flag.value) return;
+    flag.value = false;
+    writeError.value = `${label} timed out: no response from the server.`;
+  }, 8000);
+  writeTimers.push(timer);
 }
 
 function resetToDefault() {
@@ -363,12 +397,44 @@ onMounted(() => {
       loadLayoutFromStore(currentPreset.value);
     }
   }));
+  off.push(onWS('kiosk_layout_saved', (msg) => {
+    if (msg.clientId && msg.clientId !== clientId.value) return;
+    saving.value = false;
+    if (msg.ok) {
+      writeOk.value = `Layout "${msg.layout}" saved on the agent.`;
+      layoutSource.value = 'agent';
+      // Re-read so the editor reflects what the agent actually stored.
+      send({ type: 'kiosk_get_layouts', clientId: clientId.value });
+    } else {
+      writeError.value = `Agent refused the save: ${msg.error || 'unknown error'}`;
+    }
+  }));
+  off.push(onWS('kiosk_set_dispatched', (msg) => {
+    if (msg.clientId !== clientId.value) return;
+    applying.value = false;
+    writeOk.value = 'Layout dispatched to the agent.';
+  }));
+  off.push(onWS('kiosk_error', (msg) => {
+    saving.value = false;
+    applying.value = false;
+    writeError.value = msg.error || 'Kiosk command failed.';
+  }));
+  // Relay-level denial (e.g. "forbidden: admin role required"). Previously
+  // emitted and dropped on the floor, which is how a permissions failure
+  // looked exactly like a successful save.
+  off.push(onWS('error', (msg) => {
+    if (!String(msg.event || '').startsWith('kiosk_')) return;
+    saving.value = false;
+    applying.value = false;
+    writeError.value = `${msg.event}: ${msg.error || 'refused by the server'}`;
+  }));
   off.push(onWS('variant_switch_result', (msg) => {
     if (msg.clientId === clientId.value) switchingVariant.value = false;
   }));
   document.addEventListener('keydown', onKeyDown);
 });
 onUnmounted(() => {
+  writeTimers.forEach(t => clearTimeout(t));
   off.forEach(fn => fn());
   document.removeEventListener('keydown', onKeyDown);
   document.removeEventListener('pointermove', onDragPointerMove);
@@ -470,16 +536,42 @@ const statusHint = computed(() => {
               class="px-2.5 py-1 text-xs rounded bg-gray-200 dark:bg-gray-700 text-gray-700 dark:text-gray-200 hover:bg-gray-300 dark:hover:bg-gray-600">
               Reset
             </button>
-            <button @click="saveLayout" :disabled="saving"
-              class="px-2.5 py-1 text-xs rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50">
+            <button @click="saveLayout" :disabled="saving || !isAdmin"
+              :title="isAdmin ? '' : 'Requires the admin role'"
+              class="px-2.5 py-1 text-xs rounded bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed">
               {{ saving ? 'Saving...' : 'Save' }}
             </button>
-            <button @click="applyLayout" :disabled="applying"
-              class="px-2.5 py-1 text-xs rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50">
+            <button @click="applyLayout" :disabled="applying || !isAdmin"
+              :title="isAdmin ? '' : 'Requires the admin role'"
+              class="px-2.5 py-1 text-xs rounded bg-green-600 text-white hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed">
               {{ applying ? 'Applying...' : 'Apply' }}
             </button>
           </div>
         </div>
+
+        <!-- Write-permission / provenance / result banners -->
+        <p v-if="!isAdmin"
+          class="text-xs mb-2 px-2 py-1.5 rounded bg-amber-50 dark:bg-amber-900/30 text-amber-800 dark:text-amber-200 border border-amber-300 dark:border-amber-700">
+          You are signed in without the admin role. Saving and applying layouts are
+          admin-gated on the server, so those controls are disabled here.
+        </p>
+        <p v-else-if="layoutSource === 'pending'"
+          class="text-xs mb-2 px-2 py-1.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 border border-gray-300 dark:border-gray-600">
+          Waiting for saved layouts from the agent&hellip; showing a built-in default.
+        </p>
+        <p v-else-if="layoutSource === 'default'"
+          class="text-xs mb-2 px-2 py-1.5 rounded bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300 border border-gray-300 dark:border-gray-600">
+          The agent has no saved &ldquo;{{ currentPreset }}&rdquo; layout. This is a built-in
+          default and is not yet stored on the agent.
+        </p>
+        <p v-if="writeError"
+          class="text-xs mb-2 px-2 py-1.5 rounded bg-red-50 dark:bg-red-900/30 text-red-700 dark:text-red-300 border border-red-300 dark:border-red-700">
+          {{ writeError }}
+        </p>
+        <p v-else-if="writeOk"
+          class="text-xs mb-2 px-2 py-1.5 rounded bg-green-50 dark:bg-green-900/30 text-green-700 dark:text-green-300 border border-green-300 dark:border-green-700">
+          {{ writeOk }}
+        </p>
 
         <!-- Interaction hint -->
         <p class="text-xs mb-2 h-4"

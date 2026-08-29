@@ -381,10 +381,20 @@ func (s *Server) buildHandler() http.Handler {
 	if s.oidc != nil {
 		deps.AuthStatusHandler = s.oidc.HandleAuthStatus
 		deps.AdminMiddleware = s.oidc.RequireAdmin
-		if s.cfg.OIDC.AdminGroup == "" {
-			s.log.Error("oidc.adminGroup is not set: ALL admin actions are denied, including the remote shell. " +
-				"Log in and read your group from /api/auth/status, then set oidc.adminGroup to that value " +
-				"(Authentik emits numeric team IDs, not group names)")
+		if s.cfg.OIDC.AdminGroup == "" && s.cfg.OIDC.AdminPermission == "" {
+			s.log.Error("neither oidc.adminPermission nor oidc.adminGroup is set: ALL admin actions are denied, " +
+				"including the remote shell. Log in and read /api/auth/status, then set oidc.adminPermission to a " +
+				"value from its \"permissions\" array (preferred: scoped to this client), or oidc.adminGroup to one " +
+				"from \"groups\" (Authentik emits numeric team IDs, not group names)")
+		}
+		if s.cfg.OIDC.AdminPermission != "" && s.cfg.OIDC.PermissionsEndpoint == "" {
+			s.log.Error("oidc.adminPermission is set but oidc.permissionsEndpoint is not: permissions are never " +
+				"fetched, so this can never match and admin is denied. Set permissionsEndpoint to the IdP's " +
+				"per-client permissions URL (aut.hair: <issuer>/api/client-permissions)")
+		}
+		if s.cfg.OIDC.RequireEntitlement && s.cfg.OIDC.PermissionsEndpoint == "" {
+			s.log.Error("oidc.requireEntitlement is set but oidc.permissionsEndpoint is not: entitlement is never " +
+				"checked, so this setting has no effect")
 		}
 	}
 	apiRouter := api.NewRouter(deps, authMW)

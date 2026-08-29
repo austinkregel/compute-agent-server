@@ -51,6 +51,11 @@ type SessionUser struct {
 	// Groups carries the union of the "groups" and "roles" claims (if the IdP
 	// emits them). Used for admin role gating; see OIDCProvider.IsAdmin.
 	Groups []string `json:"groups,omitempty"`
+	// Teams and Permissions come from OIDCConfig.PermissionsEndpoint, resolved
+	// once at login, and are scoped to THIS client rather than to the IdP as a
+	// whole. Empty when no endpoint is configured.
+	Teams       []string `json:"teams,omitempty"`
+	Permissions []string `json:"permissions,omitempty"`
 }
 
 // claimStrings decodes a claim that may be a JSON array of strings, an array of
@@ -369,6 +374,44 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		Groups:  mergeGroups(claims.Groups, claims.Roles),
 	}
 
+	// Resolve this client's entitlement and permissions from the IdP. Runs
+	// before the session is minted so a non-entitled user never gets a cookie
+	// when requireEntitlement is set.
+	if teams, perms, permErr := p.fetchClientPermissions(ctx, token.AccessToken); permErr != nil {
+		if errors.Is(permErr, ErrNotEntitled) {
+			// The IdP answered, and the answer was no. Honour it.
+			p.log.Warn("user is not entitled to this client",
+				"sub", user.Sub, "requireEntitlement", p.cfg.RequireEntitlement)
+			if p.audit != nil {
+				p.audit.EmitAccess(audit.Event{
+					Type:      audit.TypeLoginFailure,
+					Outcome:   audit.OutcomeDeny,
+					Actor:     user.Sub,
+					ActorName: user.Email,
+					Remote:    audit.RemoteIP(r),
+					UserAgent: r.UserAgent(),
+					Detail:    map[string]any{"reason": "not_entitled"},
+				})
+			}
+			if p.cfg.RequireEntitlement {
+				http.Error(w, "You are not authorized to use this application.", http.StatusForbidden)
+				return
+			}
+		} else {
+			// The IdP did not answer. This is NOT evidence of anything about
+			// the user, so it must not read as "no permissions" — that would
+			// silently strip admin during an IdP blip, which is the exact class
+			// of hidden failure this whole path exists to avoid. Log loudly and
+			// continue with an empty permission set, which denies admin but
+			// leaves read-only access working during an outage.
+			p.log.Error("client permissions lookup failed; admin will be denied for this session",
+				"sub", user.Sub, "error", permErr)
+		}
+	} else {
+		user.Teams = teams
+		user.Permissions = perms
+	}
+
 	// Record the login with the groups the IdP emitted; this is where the
 	// Authentik team ID for oidc.adminGroup can be read off.
 	if p.audit != nil {
@@ -445,6 +488,10 @@ func (p *OIDCProvider) HandleAuthStatus(w http.ResponseWriter, r *http.Request) 
 			"authenticated": true,
 			"user":          user,
 			"isAdmin":       p.IsAdmin(user),
+			// Reported verbatim so an operator can read the value to configure
+			// adminPermission/adminGroup against, rather than guessing.
+			"permissions": user.Permissions,
+			"teams":       user.Teams,
 		})
 	} else {
 		json.NewEncoder(w).Encode(map[string]any{
@@ -514,6 +561,21 @@ func (p *OIDCProvider) IsAdmin(user *SessionUser) bool {
 	if user == nil {
 		return false
 	}
+
+	// Permission-based admin, scoped to this client by the IdP. Checked first
+	// because it is the more specific claim: it cannot be satisfied by
+	// membership that entitles the user to some other application.
+	if perm := strings.TrimSpace(p.cfg.AdminPermission); perm != "" {
+		for _, got := range user.Permissions {
+			if strings.EqualFold(strings.TrimSpace(got), perm) {
+				return true
+			}
+		}
+	}
+
+	// Group-based admin. Retained so an instance can migrate to permissions
+	// without a lockout window. Both mechanisms require explicit configuration;
+	// neither grants anything by default, so leaving both unset still denies.
 	group := strings.TrimSpace(p.cfg.AdminGroup)
 	if group == "" {
 		return false

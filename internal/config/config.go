@@ -102,6 +102,33 @@ type OIDCConfig struct {
 	// group names. The "groups" array in /api/auth/status reports the value for
 	// the current session. The IdP must be asked for the claim via Scopes.
 	AdminGroup string `json:"adminGroup"`
+
+	// PermissionsEndpoint is an absolute URL that returns the signed-in user's
+	// entitlement and permissions FOR THIS CLIENT, called once per login with
+	// the access token from the code exchange (aut.hair's
+	// GET /api/client-permissions). Empty disables the lookup entirely.
+	//
+	// This exists because an IdP can approve a user for one application and not
+	// another, and a bare "authenticated" answer cannot express that. The
+	// endpoint takes no parameters: the access token names both the user and
+	// the client, so a compromised relying party cannot probe another client's
+	// entitlements.
+	PermissionsEndpoint string `json:"permissionsEndpoint"`
+
+	// AdminPermission is the permission that grants administrative access when
+	// returned by PermissionsEndpoint. Empty disables permission-based admin.
+	//
+	// Preferred over AdminGroup: it is scoped to this client by construction,
+	// so it cannot be satisfied by membership that entitles a user to some
+	// other application, and it needs no groups claim.
+	AdminPermission string `json:"adminPermission"`
+
+	// RequireEntitlement refuses a login outright when PermissionsEndpoint
+	// reports the user is not entitled to this client (HTTP 403 not_entitled),
+	// rather than merely denying admin. A transport failure is never treated as
+	// "not entitled" — that denies admin and is logged, but does not lock the
+	// fleet dashboard out during an IdP outage.
+	RequireEntitlement bool `json:"requireEntitlement"`
 }
 
 // LoggingConfig describes log destination and verbosity.
@@ -330,5 +357,14 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("OIDC_ADMIN_GROUP"); v != "" {
 		c.OIDC.AdminGroup = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("OIDC_PERMISSIONS_ENDPOINT"); v != "" {
+		c.OIDC.PermissionsEndpoint = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("OIDC_ADMIN_PERMISSION"); v != "" {
+		c.OIDC.AdminPermission = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("OIDC_REQUIRE_ENTITLEMENT"); v != "" {
+		c.OIDC.RequireEntitlement = strings.EqualFold(strings.TrimSpace(v), "true") || v == "1"
 	}
 }
