@@ -8,6 +8,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/auth"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/cmdsig"
@@ -20,6 +21,9 @@ type AgentHandler struct {
 	log       *logging.Logger
 	authToken string
 	maxSkew   time.Duration
+
+	// audit records agent handshake outcomes. Nil disables recording.
+	audit *audit.Logger
 
 	// OnConnect is called after an agent successfully connects and authenticates.
 	// Receives the client ID. Used to broadcast client_list to dashboards.
@@ -46,6 +50,9 @@ func NewAgentHandler(store *state.Store, log *logging.Logger, authToken string, 
 	}
 }
 
+// SetAudit attaches the audit logger. Called during server wiring.
+func (h *AgentHandler) SetAudit(a *audit.Logger) { h.audit = a }
+
 // ServeHTTP upgrades the HTTP connection to WebSocket for agents.
 func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Parse and validate HMAC auth from query params
@@ -57,6 +64,7 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		h.log.Warn("agent auth: parse failed", "error", err, "remote", r.RemoteAddr)
+		h.auditAgentAuthFailure(r, q.Get("clientId"), "handshake parse failed")
 		http.Error(w, "authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -67,6 +75,9 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"error", err,
 			"remote", r.RemoteAddr,
 		)
+		// A failed handshake means the agent endpoint was reached without the
+		// shared secret.
+		h.auditAgentAuthFailure(r, handshake.ClientID, "signature validation failed")
 		http.Error(w, "authentication failed", http.StatusUnauthorized)
 		return
 	}
@@ -89,6 +100,15 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	conn.SetReadLimit(1 << 20)
 
 	h.log.Info("agent connected", "clientId", clientID, "remote", r.RemoteAddr)
+	if h.audit != nil {
+		h.audit.EmitAccess(audit.Event{
+			Type:     audit.TypeAgentConnect,
+			Outcome:  audit.OutcomeAllow,
+			Actor:    "agent:" + clientID,
+			ClientID: clientID,
+			Remote:   audit.RemoteIP(r),
+		})
+	}
 
 	// Generate session nonce and derive session key
 	nonce, err := cmdsig.GenerateSessionNonce()
@@ -218,7 +238,56 @@ func (h *AgentHandler) readLoop(ctx context.Context, clientID string, conn *webs
 }
 
 // SendSignedCommand sends a signed command to a connected agent.
+// ActorSystem attributes a command to the control plane itself rather than to
+// a person: allowlist pushes on agent connect, release-webhook fan-out, session
+// cleanup on disconnect. It is a principal name, not a credential; no HTTP
+// route accepts it.
+const ActorSystem = "system:backup-server"
+
+// actorPayloadKey carries the acting principal inside the signed payload.
+//
+// It rides in the payload rather than in a new envelope field because the
+// payload is already covered by the signature (canonicalPayload sorts and
+// re-encodes it), which keeps the canonical string byte-identical to the
+// previous format. Agents predating this field ignore the unknown key instead
+// of failing verification, so servers and agents upgrade in either order.
+const actorPayloadKey = "_actor"
+
+// SendSignedCommand signs and sends a command attributed to the control plane
+// itself. Use SendSignedCommandAs for anything a person initiated.
 func SendSignedCommand(store *state.Store, clientID string, event string, payload any, log *logging.Logger) bool {
+	return SendSignedCommandAs(store, clientID, event, payload, ActorSystem, log)
+}
+
+// SendSignedCommandAs signs and sends a command attributed to actor. The actor
+// is folded into the signed payload, so rewriting it invalidates the signature.
+func SendSignedCommandAs(store *state.Store, clientID string, event string, payload any, actor string, log *logging.Logger) bool {
+	payload = withActor(payload, actor)
+	return sendSignedCommand(store, clientID, event, payload, log)
+}
+
+// withActor returns payload with the acting principal attached. A payload that
+// is not a JSON object is wrapped so attribution is not dropped.
+func withActor(payload any, actor string) any {
+	if actor == "" {
+		actor = ActorSystem
+	}
+	switch p := payload.(type) {
+	case map[string]any:
+		out := make(map[string]any, len(p)+1)
+		for k, v := range p {
+			out[k] = v
+		}
+		out[actorPayloadKey] = actor
+		return out
+	case nil:
+		return map[string]any{actorPayloadKey: actor}
+	default:
+		return map[string]any{actorPayloadKey: actor, "value": p}
+	}
+}
+
+func sendSignedCommand(store *state.Store, clientID string, event string, payload any, log *logging.Logger) bool {
 	entry := store.GetClient(clientID)
 	if entry == nil {
 		log.Warn("send command: client not found", "clientId", clientID, "event", event)
@@ -261,4 +330,20 @@ func SendSignedCommand(store *state.Store, clientID string, event string, payloa
 
 	log.Debug("sent signed command", "clientId", clientID, "event", event, "seq", envelope.Seq)
 	return true
+}
+
+// auditAgentAuthFailure records a rejected agent handshake.
+func (h *AgentHandler) auditAgentAuthFailure(r *http.Request, clientID, reason string) {
+	if h.audit == nil {
+		return
+	}
+	h.audit.Emit(audit.Event{
+		Type:      audit.TypeAgentAuthFail,
+		Outcome:   audit.OutcomeDeny,
+		Actor:     "agent:" + clientID,
+		ClientID:  clientID,
+		Remote:    audit.RemoteIP(r),
+		UserAgent: r.UserAgent(),
+		Detail:    map[string]any{"reason": reason},
+	})
 }

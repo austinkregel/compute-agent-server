@@ -96,6 +96,14 @@ function tabClass(active) {
                 ? 'bg-gray-900 text-white border-gray-900 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-100'
                 : 'bg-transparent text-gray-600 border-transparent hover:text-gray-900 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-100 dark:hover:bg-gray-700'"
             >Allowlist</router-link>
+            <router-link
+              v-if="isAdmin"
+              to="/admin/audit"
+              class="px-2.5 py-1 rounded text-xs font-medium border transition-colors"
+              :class="route.path === '/admin/audit'
+                ? 'bg-gray-900 text-white border-gray-900 dark:bg-gray-100 dark:text-gray-900 dark:border-gray-100'
+                : 'bg-transparent text-gray-600 border-transparent hover:text-gray-900 hover:bg-gray-100 dark:text-gray-400 dark:hover:text-gray-100 dark:hover:bg-gray-700'"
+            >Audit</router-link>
             <ClientDropdown v-model="selectedClient" :clients="clientIds" />
           </div>
           <div class="flex items-center space-x-4" id="header-meta">

@@ -34,7 +34,9 @@ COPY --from=client-build /src/client/dist /app/client/dist
 VOLUME ["/app/data", "/app/certs"]
 EXPOSE 8443
 # Re-invokes this same binary (--healthcheck) rather than shelling out — the
-# distroless base has no shell/curl for a traditional `CMD curl ...` probe.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+# distroless base has no shell/curl. The probe hits /healthz. start-period
+# covers OIDC discovery, which retries with backoff for up to 5 minutes before
+# the listener binds (internal/server.New).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=330s --retries=3 \
   CMD ["/app/backup-server", "--healthcheck"]
 ENTRYPOINT ["/app/backup-server"]

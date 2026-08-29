@@ -18,6 +18,7 @@ import (
 	"github.com/go-chi/chi/v5"
 
 	"github.com/austinkregel/backup-server/internal/allowlist"
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/auth"
 	"github.com/austinkregel/backup-server/internal/config"
 	"github.com/austinkregel/backup-server/internal/database"
@@ -47,18 +48,47 @@ type Deps struct {
 	AuthStatusHandler http.HandlerFunc
 
 	// AdminMiddleware gates administrative endpoints (exec-allowlist,
-	// restart/shutdown, key resync) on an admin role. When nil, those endpoints
-	// are protected by authMiddleware only (no role gating).
+	// restart/shutdown, key resync) on an admin role. A nil value denies those
+	// endpoints outright (see DenyAll).
 	AdminMiddleware func(http.Handler) http.Handler
 
 	// StartTime is when the server started, used for uptime calculation.
 	StartTime time.Time
+
+	// Audit is the security audit trail. Nil disables the /api/audit endpoint.
+	Audit *audit.Logger
+	// AuditPath is where Audit writes; the read endpoint reads it back.
+	AuditPath string
 }
+
+// DenyAll is the middleware installed when no authentication or authorization
+// middleware was supplied. It rejects every request with the given status, so
+// a missing control closes the routes it guards rather than opening them.
+func DenyAll(status int, reason string) func(http.Handler) http.Handler {
+	return func(http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_ = json.NewEncoder(w).Encode(map[string]any{"error": reason})
+		})
+	}
+}
+
+// PassThrough is an explicit no-op middleware, for tests that need a route
+// group with no authentication. Unguarded is not expressible by omission.
+func PassThrough(next http.Handler) http.Handler { return next }
 
 // NewRouter creates the chi router with all API routes.
 // The authMiddleware parameter is a middleware that enforces authentication.
-// Pass nil to skip auth (for testing without OIDC).
+// A nil authMiddleware does NOT disable auth — it denies every protected route
+// (see DenyAll). Pass api.PassThrough explicitly to run without auth.
 func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Router {
+	if authMiddleware == nil {
+		authMiddleware = DenyAll(http.StatusUnauthorized, "unauthorized: no authentication provider configured")
+	}
+	if deps.AdminMiddleware == nil {
+		deps.AdminMiddleware = DenyAll(http.StatusForbidden, "forbidden: no admin authorization provider configured")
+	}
 	r := chi.NewRouter()
 
 	// Global middleware
@@ -75,11 +105,14 @@ func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Ro
 		r.Get("/api/auth/status", handleAuthStatus(deps))
 	}
 
+	// Liveness probe: outside the authenticated group, and contentless because
+	// it is reachable by anything that can reach the port. Zero connected
+	// agents is healthy, and the optional SMS database is not a health input.
+	r.Get("/healthz", handleHealthz)
+
 	// Protected API routes
 	api := r.Group(func(r chi.Router) {
-		if authMiddleware != nil {
-			r.Use(authMiddleware)
-		}
+		r.Use(authMiddleware)
 
 		// Status
 		r.Get("/api/status", handleStatus(deps))
@@ -92,14 +125,16 @@ func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Ro
 		// admin role when deps.AdminMiddleware is set (M2). Mutating the exec
 		// allowlist or power-cycling agents is privileged.
 		r.Group(func(r chi.Router) {
-			if deps.AdminMiddleware != nil {
-				r.Use(deps.AdminMiddleware)
-			}
+			r.Use(deps.AdminMiddleware)
 
 			// Admin commands
 			r.Post("/api/server/restart", handleRestart(deps))
 			r.Post("/api/server/shutdown", handleShutdown(deps))
 			r.Post("/api/client/{clientId}/keys/resync", handleKeysResync(deps))
+
+			// Audit trail. Admin-gated: it names who was where and when.
+			r.Get("/api/audit", handleAuditGet(deps))
+			r.Get("/api/audit/verify", handleAuditVerify(deps))
 
 			// Canonical command allowlist (pushed to all agents on change + on connect)
 			r.Get("/api/server/exec-allowlist", handleExecAllowlistGet(deps))
@@ -167,6 +202,70 @@ func NewRouter(deps Deps, authMiddleware func(http.Handler) http.Handler) chi.Ro
 }
 
 // --- Handlers ---
+
+// handleHealthz is the liveness probe. It reports only that the process is up
+// and serving.
+func handleHealthz(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"status":"ok"}`))
+}
+
+// handleAuditGet returns recent audit records, most recent last, together with
+// the chain verification result for the whole log.
+func handleAuditGet(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.Audit == nil || deps.AuditPath == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "audit log not configured"})
+			return
+		}
+		limit := 200
+		if v := strings.TrimSpace(r.URL.Query().Get("limit")); v != "" {
+			if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 5000 {
+				limit = n
+			}
+		}
+		events, err := audit.Read(deps.AuditPath, limit)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "audit log unreadable"})
+			return
+		}
+		if t := strings.TrimSpace(r.URL.Query().Get("type")); t != "" {
+			filtered := events[:0:0]
+			for _, e := range events {
+				if e.Type == t {
+					filtered = append(filtered, e)
+				}
+			}
+			events = filtered
+		}
+		// Verify the whole chain, not just the returned window: a break
+		// anywhere invalidates the window too.
+		all, _ := audit.Read(deps.AuditPath, 0)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"events": events,
+			"chain":  audit.Verify(all),
+		})
+	}
+}
+
+// handleAuditVerify walks the full chain and reports where, if anywhere, it
+// breaks.
+func handleAuditVerify(deps Deps) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if deps.Audit == nil || deps.AuditPath == "" {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{"error": "audit log not configured"})
+			return
+		}
+		events, err := audit.Read(deps.AuditPath, 0)
+		if err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "audit log unreadable"})
+			return
+		}
+		writeJSON(w, http.StatusOK, audit.Verify(events))
+	}
+}
 
 func handleAuthStatus(deps Deps) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -441,6 +540,25 @@ func auditAllowlist(deps Deps, r *http.Request, action string, d allowlist.Diff,
 		"actor", actor, "action", action,
 		"added", d.Added, "removed", d.Removed,
 		"total", len(deps.Allowlist.Commands()), "agentsUpdated", agentsUpdated)
+
+	// Changing the allowlist changes what every connected agent will execute.
+	if deps.Audit != nil {
+		e := audit.Event{
+			Type:    audit.TypeAllowlistChange,
+			Outcome: audit.OutcomeAllow,
+			Actor:   actor,
+			Remote:  audit.RemoteIP(r),
+			Action:  action,
+			Detail: map[string]any{
+				"added": d.Added, "removed": d.Removed,
+				"total": len(deps.Allowlist.Commands()), "agentsUpdated": agentsUpdated,
+			},
+		}
+		if u := auth.UserFromContext(r.Context()); u != nil {
+			e.ActorName, e.Groups = u.Email, u.Groups
+		}
+		deps.Audit.EmitAccess(e)
+	}
 }
 
 // firstInvalidCommand returns the first entry containing forbidden shell

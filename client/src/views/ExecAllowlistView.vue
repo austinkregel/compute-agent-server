@@ -11,8 +11,8 @@
 
     <!-- Allow-all warning -->
     <div v-if="empty" class="rounded-lg border border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-900/30 p-3">
-      <p class="text-sm font-medium text-amber-800 dark:text-amber-300">⚠ The allowlist is empty — agents allow <strong>any</strong> command.</p>
-      <p class="text-xs text-amber-700 dark:text-amber-400 mt-1">Add at least one entry to enforce a policy.</p>
+      <p class="text-sm font-medium text-amber-800 dark:text-amber-300">⚠ The allowlist is empty — agents will refuse <strong>every</strong> command.</p>
+      <p class="text-xs text-amber-700 dark:text-amber-400 mt-1">An empty list denies all exec/admin_run. Add at least one entry to permit anything.</p>
     </div>
 
     <!-- Add entry -->

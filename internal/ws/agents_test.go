@@ -377,3 +377,65 @@ func TestSendSignedCommand(t *testing.T) {
 		t.Fatalf("agent-side verify failed: %v", err)
 	}
 }
+
+// The acting principal is folded into the signed payload rather than added as
+// a new envelope field, leaving the canonical signing string unchanged so an
+// agent predating the field still verifies commands carrying it.
+func TestWithActor_KeepsPayloadSignable(t *testing.T) {
+	key := cmdsig.DeriveSessionKey("token", "nonce")
+	signer := cmdsig.NewSigner(key)
+
+	env, err := signer.Sign("exec_request", withActor(map[string]any{"command": "id"}, "alice"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := cmdsig.NewVerifier(key).Verify(env); err != nil {
+		t.Fatalf("signed command with actor failed to verify: %v", err)
+	}
+
+	var got map[string]any
+	if err := json.Unmarshal(env.Payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["_actor"] != "alice" {
+		t.Errorf("_actor = %v, want alice", got["_actor"])
+	}
+	if got["command"] != "id" {
+		t.Errorf("original payload field lost: %v", got)
+	}
+}
+
+// Attribution is not dropped, whatever shape the payload has.
+func TestWithActor_AlwaysAttributes(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		payload any
+		actor   string
+		want    string
+	}{
+		{"map", map[string]any{"a": 1}, "alice", "alice"},
+		{"nil payload", nil, "alice", "alice"},
+		{"empty actor falls back to system", map[string]any{}, "", ActorSystem},
+		{"non-object payload is wrapped", "scalar", "alice", "alice"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, ok := withActor(tc.payload, tc.actor).(map[string]any)
+			if !ok {
+				t.Fatalf("withActor did not return an object: %T", got)
+			}
+			if got[actorPayloadKey] != tc.want {
+				t.Errorf("actor = %v, want %v", got[actorPayloadKey], tc.want)
+			}
+		})
+	}
+}
+
+// withActor must not mutate the caller's map: relay handlers build a payload
+// once, and mutation would leak the actor across sends.
+func TestWithActor_DoesNotMutateInput(t *testing.T) {
+	original := map[string]any{"command": "id"}
+	withActor(original, "alice")
+	if _, leaked := original[actorPayloadKey]; leaked {
+		t.Error("withActor mutated the caller's payload")
+	}
+}

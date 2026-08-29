@@ -57,6 +57,18 @@ type Config struct {
 	// this host). Only used when TraefikDynamicDir is set.
 	TraefikBackendURL string `json:"traefikBackendUrl"`
 
+	// AuditLogFile is the append-only, hash-chained security audit trail
+	// (internal/audit). Separate from Logging.FilePath so operational log
+	// rotation and filtering cannot affect it.
+	AuditLogFile string `json:"auditLogFile"`
+
+	// InsecureAllowUnauthenticated permits running with oidc.enabled false.
+	// Without OIDC there is no authentication middleware, so every /api/*
+	// route — including server shutdown and exec-allowlist mutation, which
+	// pushes to every connected agent — is reachable by anyone who can reach
+	// the port. Startup refuses that configuration unless this flag is set.
+	InsecureAllowUnauthenticated bool `json:"insecureAllowUnauthenticated"`
+
 	OIDC    OIDCConfig    `json:"oidc"`
 	Logging LoggingConfig `json:"logging"`
 }
@@ -82,11 +94,13 @@ type OIDCConfig struct {
 	ClientAuthMethod string   `json:"clientAuthMethod"`
 
 	// AdminGroup is the OIDC groups/roles claim value that grants administrative
-	// access (e.g. managing the exec allowlist, restart/shutdown). When empty,
-	// admin endpoints fall back to authenticated-only (no role gating) — the
-	// server logs a warning at startup in that case. To enforce gating, the IdP
-	// must emit the membership in a "groups" or "roles" claim (request the
-	// appropriate scope via Scopes).
+	// access: managing the exec allowlist, restart/shutdown, and every
+	// privileged dashboard event (remote shell, exec, file mutation).
+	//
+	// Empty denies all admin actions. There is no default because the value is
+	// whatever the IdP emits; Authentik emits numeric team IDs rather than
+	// group names. The "groups" array in /api/auth/status reports the value for
+	// the current session. The IdP must be asked for the claim via Scopes.
 	AdminGroup string `json:"adminGroup"`
 }
 
@@ -129,6 +143,11 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.AuthToken) == "" {
 		return errors.New("authToken is required")
+	}
+	if !c.OIDC.Enabled && !c.InsecureAllowUnauthenticated {
+		return errors.New("oidc.enabled is false: the REST API and dashboard would serve with no authentication at all " +
+			"(including POST /api/server/shutdown and PUT /api/server/exec-allowlist). " +
+			"Enable OIDC, or set insecureAllowUnauthenticated:true to accept that risk explicitly")
 	}
 	if c.OIDC.Enabled {
 		switch {
@@ -192,6 +211,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.SMSEncryptionKeyFile == "" {
 		c.SMSEncryptionKeyFile = "sms-encryption.key"
+	}
+	if c.AuditLogFile == "" {
+		c.AuditLogFile = filepath.Join(".", "audit.jsonl")
 	}
 }
 
@@ -269,6 +291,13 @@ func (c *Config) applyEnvOverrides() {
 	}
 	if v := os.Getenv("TRAEFIK_BACKEND_URL"); v != "" {
 		c.TraefikBackendURL = strings.TrimSpace(v)
+	}
+
+	if v := os.Getenv("AUDIT_LOG_FILE"); v != "" {
+		c.AuditLogFile = strings.TrimSpace(v)
+	}
+	if v := os.Getenv("INSECURE_ALLOW_UNAUTHENTICATED"); v != "" {
+		c.InsecureAllowUnauthenticated = v == "true" || v == "1"
 	}
 
 	// OIDC env overrides

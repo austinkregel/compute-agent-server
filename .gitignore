@@ -15,4 +15,7 @@ coverage/
 .ssl_server_token
 exec-allowlist.json
 exec-allowlist.json.tmp
+# Security audit trail: contains OIDC subject IDs, emails, and client IPs.
+audit.jsonl
+audit.jsonl.*
 !pkg.config.json

@@ -33,15 +33,18 @@ func handleVersionFlag(showVersion bool) bool {
 	return false
 }
 
-// runHealthcheck probes this server's own /api/status over loopback and
-// returns true if it responded successfully. Used as a Docker HEALTHCHECK —
+// runHealthcheck probes this server's own /healthz over loopback and returns
+// true if it responded successfully. Used as a Docker HEALTHCHECK —
 // re-invokes this same binary rather than shelling out, since the distroless
 // runtime image has no shell/curl. Tries plain HTTP first (the common case),
 // then HTTPS with certificate verification skipped (a loopback self-check
 // has no MITM exposure, and the server's own cert isn't necessarily trusted
 // by this process regardless).
+//
+// /healthz rather than /api/status: /api/status is behind the auth middleware
+// and returns the full client inventory.
 func runHealthcheck(port int) bool {
-	url := fmt.Sprintf("http://127.0.0.1:%d/api/status", port)
+	url := fmt.Sprintf("http://127.0.0.1:%d/healthz", port)
 	client := &http.Client{Timeout: 3 * time.Second}
 	if resp, err := client.Get(url); err == nil {
 		defer resp.Body.Close()
@@ -56,7 +59,7 @@ func runHealthcheck(port int) bool {
 			TLSClientConfig: &cryptotls.Config{InsecureSkipVerify: true}, //nolint:gosec // loopback self-check only
 		},
 	}
-	resp, err := httpsClient.Get(fmt.Sprintf("https://127.0.0.1:%d/api/status", port))
+	resp, err := httpsClient.Get(fmt.Sprintf("https://127.0.0.1:%d/healthz", port))
 	if err != nil {
 		return false
 	}

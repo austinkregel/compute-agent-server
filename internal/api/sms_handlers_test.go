@@ -37,7 +37,7 @@ func (noopDash) SendTo(connID string, event string, data any) bool { return fals
 func TestHandleSMSThreads_NoStoreConfigured(t *testing.T) {
 	deps := testDeps(t) // no SMS store
 	deps.Relay = relay.New(deps.Store, deps.Log, noopDash{}, t.TempDir())
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/phone-1/sms/threads", "")
 	if w.Code != http.StatusServiceUnavailable {
@@ -50,7 +50,7 @@ func TestHandleSMSThreads_ReadsFromStore(t *testing.T) {
 	if _, err := deps.SMS.UpsertThread("phone-1", "+15551234", "hello", time.Now(), false); err != nil {
 		t.Fatalf("seed thread: %v", err)
 	}
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/phone-1/sms/threads", "")
 	if w.Code != http.StatusOK {
@@ -72,7 +72,7 @@ func TestHandleSMSMessages_ReadsFromStore(t *testing.T) {
 	if _, err := deps.SMS.InsertMessage("phone-1", threadID, "m1", "+15551234", "in", "hello there", "received", time.Now()); err != nil {
 		t.Fatalf("seed message: %v", err)
 	}
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", fmt.Sprintf("/api/client/phone-1/sms/threads/%d/messages", threadID), "")
 	if w.Code != http.StatusOK {
@@ -87,7 +87,7 @@ func TestHandleSMSMessages_ReadsFromStore(t *testing.T) {
 
 func TestHandleSMSSend_ClientOffline(t *testing.T) {
 	deps := testDepsWithSMS(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/client/phone-1/sms/send", `{"to":"+15551234","body":"hi"}`)
 	if w.Code != http.StatusNotFound {
@@ -98,7 +98,7 @@ func TestHandleSMSSend_ClientOffline(t *testing.T) {
 func TestHandleSMSSend_InvalidBody(t *testing.T) {
 	deps := testDepsWithSMS(t)
 	deps.Store.AddClient("phone-1", nil)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/client/phone-1/sms/send", `{"to":""}`)
 	if w.Code != http.StatusBadRequest {

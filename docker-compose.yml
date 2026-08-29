@@ -35,12 +35,27 @@ services:
     container_name: backup-server
     restart: unless-stopped
     network_mode: host
+    # audit.jsonl defaults to the container filesystem; keep it on the data
+    # volume so the hash chain survives container recreation.
+    environment:
+      AUDIT_LOG_FILE: /app/data/audit.jsonl
+    # The distroless runtime has no shell or curl, so the binary probes itself
+    # via exec form. It reads the port from server-config.json and hits
+    # /healthz. start_period covers OIDC discovery, which retries with backoff
+    # for up to 5 minutes before the listener binds (internal/server.New).
+    healthcheck:
+      test: ["CMD", "/app/backup-server", "--healthcheck"]
+      interval: 30s
+      timeout: 5s
+      start_period: 330s
+      retries: 3
     volumes:
       - ./server-config.json:/app/server-config.json:ro
       - backup-server-data:/app/data
       # Optional: mount a cert/key pair here to enable TLS (fullchain.pem +
-      # privkey.pem) — the server falls back to plain HTTP if absent. Also
-      # where internal/traefikcert writes certs extracted from Traefik.
+      # privkey.pem). An absent certs dir runs plain HTTP; an unloadable cert
+      # is fatal. Also where internal/traefikcert writes certs extracted from
+      # Traefik.
       - backup-server-certs:/app/certs
       # Traefik's ACME store (read-only) and file-provider dynamic-config dir
       # (read-write, for self-registration) — see comment above. Both no-op

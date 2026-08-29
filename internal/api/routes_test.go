@@ -21,10 +21,13 @@ func testDeps(t *testing.T) Deps {
 	}
 	t.Cleanup(func() { log.Sync() })
 	return Deps{
-		Store:     state.New(),
-		Log:       log,
-		Config:    &config.Config{GithubUser: "testuser"},
-		Allowlist: allowlist.New("", nil, log), // in-memory (no persistence) for tests
+		Store:  state.New(),
+		Log:    log,
+		Config: &config.Config{GithubUser: "testuser"},
+		// NewRouter denies on nil middleware, so tests exercising handler
+		// logic opt out of the gates explicitly.
+		AdminMiddleware: PassThrough,
+		Allowlist:       allowlist.New("", nil, log), // in-memory (no persistence) for tests
 	}
 }
 
@@ -54,7 +57,7 @@ func decodeJSON(t *testing.T, w *httptest.ResponseRecorder) map[string]any {
 
 func TestAuthStatus(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/auth/status", "")
 	if w.Code != http.StatusOK {
@@ -70,7 +73,7 @@ func TestAuthStatus(t *testing.T) {
 
 func TestStatus_NoClients(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/status", "")
 	if w.Code != http.StatusOK {
@@ -89,7 +92,7 @@ func TestStatus_WithClients(t *testing.T) {
 	deps := testDeps(t)
 	deps.Store.AddClient("node-1", nil)
 	deps.Store.AddClient("node-2", nil)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/status", "")
 	if w.Code != http.StatusOK {
@@ -105,7 +108,7 @@ func TestStatus_WithClients(t *testing.T) {
 
 func TestClientStats_NotFound(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/node-1/stats", "")
 	if w.Code != http.StatusNotFound {
@@ -125,7 +128,7 @@ func TestClientStats_Found(t *testing.T) {
 		"hostname": "testhost",
 		"cpus":     float64(8),
 	})
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/node-1/stats", "")
 	if w.Code != http.StatusOK {
@@ -144,7 +147,7 @@ func TestClientStats_Found(t *testing.T) {
 
 func TestClientAlerts_NoAlerts(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/node-1/alerts", "")
 	if w.Code != http.StatusOK {
@@ -171,7 +174,7 @@ func TestClientAlerts_WithAlerts(t *testing.T) {
 		"totalCount":  float64(1),
 		"hasCritical": true,
 	})
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/node-1/alerts", "")
 	if w.Code != http.StatusOK {
@@ -190,7 +193,7 @@ func TestClientAlerts_WithAlerts(t *testing.T) {
 
 func TestRestart_MissingBody(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/server/restart", "")
 	if w.Code != http.StatusBadRequest {
@@ -200,7 +203,7 @@ func TestRestart_MissingBody(t *testing.T) {
 
 func TestRestart_MissingClientId(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/server/restart", `{}`)
 	if w.Code != http.StatusBadRequest {
@@ -210,7 +213,7 @@ func TestRestart_MissingClientId(t *testing.T) {
 
 func TestRestart_ClientOffline(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/server/restart", `{"clientId":"node-1"}`)
 	if w.Code != http.StatusNotFound {
@@ -226,7 +229,7 @@ func TestRestart_ClientOffline(t *testing.T) {
 
 func TestShutdown_MissingBody(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/server/shutdown", "")
 	if w.Code != http.StatusBadRequest {
@@ -236,7 +239,7 @@ func TestShutdown_MissingBody(t *testing.T) {
 
 func TestShutdown_ClientOffline(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/server/shutdown", `{"clientId":"node-1"}`)
 	if w.Code != http.StatusNotFound {
@@ -249,7 +252,7 @@ func TestShutdown_ClientOffline(t *testing.T) {
 func TestKeysResync_NoGithubUser(t *testing.T) {
 	deps := testDeps(t)
 	deps.Config.GithubUser = "" // No default
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/client/node-1/keys/resync", `{}`)
 	if w.Code != http.StatusBadRequest {
@@ -263,7 +266,7 @@ func TestKeysResync_NoGithubUser(t *testing.T) {
 
 func TestKeysResync_InvalidGithubUser(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/client/node-1/keys/resync", `{"githubUser":"invalid user!@#"}`)
 	if w.Code != http.StatusBadRequest {
@@ -277,7 +280,7 @@ func TestKeysResync_InvalidGithubUser(t *testing.T) {
 
 func TestKeysResync_ClientOffline(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/client/node-1/keys/resync", `{"githubUser":"validuser"}`)
 	if w.Code != http.StatusNotFound {
@@ -289,7 +292,7 @@ func TestKeysResync_FallsBackToConfigUser(t *testing.T) {
 	deps := testDeps(t)
 	deps.Config.GithubUser = "configuser"
 	deps.Store.AddClient("node-1", nil)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	// Send empty body (no githubUser), should use config value
 	w := doRequest(t, r, "POST", "/api/client/node-1/keys/resync", `{}`)
@@ -306,7 +309,7 @@ func TestKeysResync_FallsBackToConfigUser(t *testing.T) {
 
 func TestCronValidate_ValidCrontab(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	body := `{"crontab":"* * * * * /usr/bin/echo hello\n# comment\nSHELL=/bin/bash\n"}`
 	w := doRequest(t, r, "POST", "/api/cron/validate", body)
@@ -321,7 +324,7 @@ func TestCronValidate_ValidCrontab(t *testing.T) {
 
 func TestCronValidate_InvalidCrontab(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	// Only 3 fields — not enough
 	body := `{"crontab":"* * *\n"}`
@@ -341,7 +344,7 @@ func TestCronValidate_InvalidCrontab(t *testing.T) {
 
 func TestCronValidate_MissingBody(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/cron/validate", "")
 	if w.Code != http.StatusBadRequest {
@@ -396,7 +399,7 @@ func TestValidateCronSyntax_MultipleErrors(t *testing.T) {
 
 func TestTasks_GetReturnsEmpty(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/tasks", "")
 	if w.Code != http.StatusOK {
@@ -411,7 +414,7 @@ func TestTasks_GetReturnsEmpty(t *testing.T) {
 
 func TestTasks_PostReturnsGone(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/tasks", `{}`)
 	if w.Code != http.StatusGone {
@@ -423,7 +426,7 @@ func TestTasks_PostReturnsGone(t *testing.T) {
 
 func TestNotFound_APIPath(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/nonexistent", "")
 	if w.Code != http.StatusNotFound {
@@ -497,7 +500,7 @@ func TestAdminMiddleware_GatesAllowlistButNotStatus(t *testing.T) {
 			json.NewEncoder(w).Encode(map[string]any{"error": "forbidden"})
 		})
 	}
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	// Admin-gated route is blocked.
 	if w := doRequest(t, r, "GET", "/api/server/exec-allowlist", ""); w.Code != http.StatusForbidden {
@@ -516,20 +519,71 @@ func TestAdminMiddleware_GatesAllowlistButNotStatus(t *testing.T) {
 	}
 }
 
-func TestAdminMiddleware_NilAllowsAuthenticated(t *testing.T) {
+// A nil AdminMiddleware means the admin authorization provider was never wired
+// up, which must close the admin routes rather than open them.
+func TestAdminMiddleware_NilDeniesAdminRoutes(t *testing.T) {
 	deps := testDeps(t)
+	deps.AdminMiddleware = nil
 	deps.Allowlist = allowlist.New("", []string{"git", "ls"}, deps.Log)
-	// AdminMiddleware nil -> no role gating (existing behavior).
+	r := NewRouter(deps, PassThrough)
+
+	for _, tc := range []struct{ method, path, body string }{
+		{"GET", "/api/server/exec-allowlist", ""},
+		{"PUT", "/api/server/exec-allowlist", `{"commands":["ls"]}`},
+		{"POST", "/api/server/exec-allowlist", `{"add":["rm"]}`},
+		{"POST", "/api/server/restart", `{"clientId":"x"}`},
+		{"POST", "/api/server/shutdown", `{"clientId":"x"}`},
+		{"POST", "/api/client/x/keys/resync", ""},
+	} {
+		if w := doRequest(t, r, tc.method, tc.path, tc.body); w.Code != http.StatusForbidden {
+			t.Errorf("%s %s = %d, want 403 when AdminMiddleware is nil", tc.method, tc.path, w.Code)
+		}
+	}
+
+	// The rejected mutations must not have changed the allowlist.
+	if got := deps.Allowlist.Commands(); len(got) != 2 {
+		t.Errorf("allowlist = %v, want the original 2 entries", got)
+	}
+}
+
+// A nil authMiddleware likewise closes every protected route.
+func TestAuthMiddleware_NilDeniesProtectedRoutes(t *testing.T) {
+	deps := testDeps(t)
 	r := NewRouter(deps, nil)
 
-	w := doRequest(t, r, "GET", "/api/server/exec-allowlist", "")
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200 when AdminMiddleware nil", w.Code)
+	for _, path := range []string{"/api/status", "/api/cron", "/api/client/x/stats", "/api/swarm/clusters"} {
+		if w := doRequest(t, r, "GET", path, ""); w.Code != http.StatusUnauthorized {
+			t.Errorf("GET %s = %d, want 401 when authMiddleware is nil", path, w.Code)
+		}
 	}
-	result := decodeJSON(t, w)
-	cmds, ok := result["commands"].([]any)
-	if !ok || len(cmds) != 2 {
-		t.Errorf("commands = %v, want 2 entries", result["commands"])
+
+	// The liveness probe is outside the gate.
+	if w := doRequest(t, r, "GET", "/healthz", ""); w.Code != http.StatusOK {
+		t.Errorf("GET /healthz = %d, want 200 (probe must not require auth)", w.Code)
+	}
+}
+
+// The probe answers liveness only: no client inventory, uptime, or version.
+func TestHealthz_IsContentless(t *testing.T) {
+	deps := testDeps(t)
+	deps.Store.AddClient("secret-hostname", nil)
+	r := NewRouter(deps, PassThrough)
+
+	w := doRequest(t, r, "GET", "/healthz", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", w.Code)
+	}
+	if got := w.Header().Get("Cache-Control"); got != "no-store" {
+		t.Errorf("Cache-Control = %q, want no-store", got)
+	}
+	body := w.Body.String()
+	if strings.TrimSpace(body) != `{"status":"ok"}` {
+		t.Fatalf("body = %q, want exactly {\"status\":\"ok\"}", body)
+	}
+	for _, leak := range []string{"secret-hostname", "uptime", "clientIds", "clients", "version"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("probe body leaked %q: %s", leak, body)
+		}
 	}
 }
 
@@ -539,7 +593,7 @@ func TestExecAllowlistGet_ReturnsEntriesAndProvenance(t *testing.T) {
 	deps := testDeps(t)
 	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
 	deps.Allowlist.Add([]string{"sha256sum /root/.rebase/bin/rebase-indexer"}, "")
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/server/exec-allowlist", "")
 	if w.Code != http.StatusOK {
@@ -557,7 +611,7 @@ func TestExecAllowlistGet_ReturnsEntriesAndProvenance(t *testing.T) {
 
 func TestExecAllowlistPut_RejectsForbiddenChars(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 	w := doRequest(t, r, "PUT", "/api/server/exec-allowlist", `{"commands":["git; rm -rf /"]}`)
 	if w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for forbidden chars", w.Code)
@@ -567,7 +621,7 @@ func TestExecAllowlistPut_RejectsForbiddenChars(t *testing.T) {
 func TestExecAllowlistPut_EmptyRequiresConfirm(t *testing.T) {
 	deps := testDeps(t)
 	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	// Without confirmEmpty -> blocked.
 	if w := doRequest(t, r, "PUT", "/api/server/exec-allowlist", `{"commands":[]}`); w.Code != http.StatusBadRequest {
@@ -585,7 +639,7 @@ func TestExecAllowlistPut_EmptyRequiresConfirm(t *testing.T) {
 func TestExecAllowlistPost_AddRemove(t *testing.T) {
 	deps := testDeps(t)
 	deps.Allowlist = allowlist.New("", []string{"git", "ls"}, deps.Log)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{"add":["cat"],"remove":["ls"]}`)
 	if w.Code != http.StatusOK {
@@ -607,7 +661,7 @@ func TestExecAllowlistPost_AddRemove(t *testing.T) {
 func TestExecAllowlistPost_RemoveAllRequiresConfirm(t *testing.T) {
 	deps := testDeps(t)
 	deps.Allowlist = allowlist.New("", []string{"git"}, deps.Log)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	if w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{"remove":["git"]}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 when remove clears list", w.Code)
@@ -619,7 +673,7 @@ func TestExecAllowlistPost_RemoveAllRequiresConfirm(t *testing.T) {
 
 func TestExecAllowlistPost_EmptyBodyRejected(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 	if w := doRequest(t, r, "POST", "/api/server/exec-allowlist", `{}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("status = %d, want 400 for empty add/remove", w.Code)
 	}
@@ -629,7 +683,7 @@ func TestExecAllowlistPost_EmptyBodyRejected(t *testing.T) {
 
 func TestSecurityHeaders_OnAPIRoutes(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/status", "")
 	if w.Header().Get("X-Content-Type-Options") != "nosniff" {
@@ -647,7 +701,7 @@ func TestSecurityHeaders_OnAPIRoutes(t *testing.T) {
 
 func TestJSONContentType_OnAPI(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/status", "")
 	ct := w.Header().Get("Content-Type")
@@ -660,7 +714,7 @@ func TestJSONContentType_OnAPI(t *testing.T) {
 
 func TestDoubleSlash_Normalized(t *testing.T) {
 	deps := testDeps(t)
-	r := NewRouter(deps, nil)
+	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "//api//status", "")
 	if w.Code != http.StatusOK {

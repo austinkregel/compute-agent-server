@@ -2,10 +2,14 @@ package relay
 
 import (
 	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/auth"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/backup-server/internal/ws"
@@ -93,10 +97,21 @@ func testRelay(t *testing.T) (*Relay, *mockDash, *state.Store) {
 	return r, md, store
 }
 
+// newMockDC returns an admin dashboard connection, since most relay tests
+// exercise privileged handlers. newMockNonAdminDC covers the gate itself.
 func newMockDC(id string) *ws.DashboardConn {
 	return &ws.DashboardConn{
-		ID:   id,
-		User: &auth.SessionUser{Sub: "test-user", Email: "test@example.com"},
+		ID:      id,
+		User:    &auth.SessionUser{Sub: "test-user", Email: "test@example.com"},
+		IsAdmin: true,
+	}
+}
+
+func newMockNonAdminDC(id string) *ws.DashboardConn {
+	return &ws.DashboardConn{
+		ID:      id,
+		User:    &auth.SessionUser{Sub: "member-user", Email: "member@example.com"},
+		IsAdmin: false,
 	}
 }
 
@@ -1419,5 +1434,172 @@ func TestDockerDashboardEvent_AllEventTypes(t *testing.T) {
 		if dispatched == nil {
 			t.Errorf("expected %s_dispatched to be sent", event)
 		}
+	}
+}
+
+// /ws/dashboard delivers the same capabilities as /api/server/*, so a
+// non-admin session must not be able to open a root shell, run a command, or
+// mutate the filesystem on a managed machine through it.
+func TestDashboardEvent_NonAdminDeniedPrivilegedEvents(t *testing.T) {
+	privileged := []string{
+		"shell_start", "start_shell", "shell_input", "shell_resize", "shell_close",
+		"exec_request", "exec_cancel",
+		"file_get_request", "file_put_start", "file_put_chunk", "file_put_finish",
+		"file_delete_request", "file_chmod_request", "file_mkdir_request",
+		"file_rename_request",
+		"backup_approve", "switch_variant", "kiosk_set", "kiosk_save_layout",
+		"swarm_init_request", "swarm_join_request", "swarm_leave_request",
+	}
+
+	for _, event := range privileged {
+		t.Run(event, func(t *testing.T) {
+			r, md, store := testRelay(t)
+			store.AddClient("node-1", nil)
+			dc := newMockNonAdminDC("dash-1")
+
+			r.HandleDashboardEvent(dc, makeMsg(event, map[string]any{
+				"clientId": "node-1", "sessionId": "s1",
+				"command": "id", "path": "/etc/passwd", "requestId": "r1",
+			}))
+
+			if md.findSent("dash-1", "error") == nil {
+				t.Errorf("%s: no error returned to a non-admin dashboard", event)
+			}
+			r.shellMu.RLock()
+			shells := len(r.shellSessions)
+			r.shellMu.RUnlock()
+			if shells != 0 {
+				t.Errorf("%s: opened %d shell session(s) for a non-admin", event, shells)
+			}
+		})
+	}
+}
+
+// Read-only events stay usable by a non-admin.
+func TestDashboardEvent_NonAdminAllowedReadOnlyEvents(t *testing.T) {
+	for _, event := range []string{"dir_list_request", "log_tail_start", "backup_plan_request"} {
+		t.Run(event, func(t *testing.T) {
+			r, md, store := testRelay(t)
+			store.AddClient("node-1", nil)
+
+			r.HandleDashboardEvent(newMockNonAdminDC("dash-1"), makeMsg(event, map[string]any{
+				"clientId": "node-1", "path": "/tmp", "requestId": "r1", "lines": 10,
+			}))
+
+			if sent := md.findSent("dash-1", "error"); sent != nil {
+				if m := toMap(sent.Data); m["error"] == "forbidden: admin role required" {
+					t.Errorf("%s was admin-gated; read-only events must stay available", event)
+				}
+			}
+		})
+	}
+}
+
+// Deny-by-default: an unclassified event is treated as privileged.
+func TestDashboardEvent_UnknownEventIsPrivileged(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+
+	r.HandleDashboardEvent(newMockNonAdminDC("dash-1"),
+		makeMsg("some_future_event", map[string]any{"clientId": "node-1"}))
+
+	if md.findSent("dash-1", "error") == nil {
+		t.Error("unclassified event was not denied for a non-admin; want deny-by-default")
+	}
+}
+
+// An admin is unaffected by the gate.
+func TestDashboardEvent_AdminRetainsPrivilegedEvents(t *testing.T) {
+	r, _, store := testRelay(t)
+	store.AddClient("node-1", nil)
+
+	r.HandleDashboardEvent(newMockDC("dash-1"), makeMsg("shell_start", map[string]any{"clientId": "node-1"}))
+
+	r.shellMu.RLock()
+	shells := len(r.shellSessions)
+	r.shellMu.RUnlock()
+	if shells != 1 {
+		t.Errorf("admin shell sessions = %d, want 1", shells)
+	}
+}
+
+// The audit record for a privileged event is produced by the gate rather than
+// by individual handlers, and covers denied attempts as well as allowed ones.
+func TestDashboardEvent_AuditsAtTheGate(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	al, err := audit.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer al.Close()
+
+	r, _, store := testRelay(t)
+	r.SetAudit(al)
+	store.AddClient("node-1", nil)
+
+	r.HandleDashboardEvent(newMockDC("dash-1"),
+		makeMsg("shell_start", map[string]any{"clientId": "node-1"}))
+	r.HandleDashboardEvent(newMockNonAdminDC("dash-2"),
+		makeMsg("exec_request", map[string]any{"clientId": "node-1", "command": "id"}))
+	// Read-only traffic stays out of the trail.
+	r.HandleDashboardEvent(newMockNonAdminDC("dash-2"),
+		makeMsg("dir_list_request", map[string]any{"clientId": "node-1", "path": "/tmp"}))
+
+	events, err := audit.Read(path, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var allowed, denied, dirList int
+	for _, e := range events {
+		switch {
+		case e.Type == audit.TypePrivilegedEvent && e.Action == "shell_start":
+			allowed++
+			if e.Actor != "test-user" || e.ClientID != "node-1" {
+				t.Errorf("allowed record missing attribution: %+v", e)
+			}
+		case e.Type == audit.TypeEventDenied && e.Action == "exec_request":
+			denied++
+			if e.Actor != "member-user" {
+				t.Errorf("denied record missing attribution: %+v", e)
+			}
+		case e.Action == "dir_list_request":
+			dirList++
+		}
+	}
+	if allowed != 1 {
+		t.Errorf("allowed privileged events recorded = %d, want 1", allowed)
+	}
+	if denied != 1 {
+		t.Errorf("denied privileged events recorded = %d, want 1", denied)
+	}
+	if dirList != 0 {
+		t.Errorf("read-only event was recorded %d time(s); want 0", dirList)
+	}
+	if res := audit.Verify(events); !res.Valid {
+		t.Errorf("audit chain invalid: %+v", res)
+	}
+}
+
+// Shell input and file contents must not be copied into the audit trail.
+func TestDashboardEvent_AuditDoesNotRecordPayloadBodies(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	al, _ := audit.Open(path)
+	defer al.Close()
+
+	r, _, store := testRelay(t)
+	r.SetAudit(al)
+	store.AddClient("node-1", nil)
+
+	r.HandleDashboardEvent(newMockDC("dash-1"), makeMsg("file_put_chunk", map[string]any{
+		"clientId": "node-1", "path": "/tmp/x", "data": "SUPER-SECRET-CONTENT",
+	}))
+
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), "SUPER-SECRET-CONTENT") {
+		t.Error("audit trail captured a payload body; it must record metadata only")
+	}
+	if !strings.Contains(string(raw), "/tmp/x") {
+		t.Error("audit trail should still record the path acted upon")
 	}
 }

@@ -3,6 +3,7 @@ import { checkAuth, isAdmin } from './lib/auth.js';
 
 import DashboardView from './views/DashboardView.vue';
 import ExecAllowlistView from './views/ExecAllowlistView.vue';
+import AuditView from './views/AuditView.vue';
 import ActionsView from './views/ActionsView.vue';
 import LogsView from './views/LogsView.vue';
 import BackupsView from './views/BackupsView.vue';
@@ -52,6 +53,11 @@ const router = createRouter({
     {
       path: '/admin/exec-allowlist',
       component: ExecAllowlistView,
+      meta: { requiresAuth: true, requiresAdmin: true }
+    },
+    {
+      path: '/admin/audit',
+      component: AuditView,
       meta: { requiresAuth: true, requiresAdmin: true }
     },
     { 

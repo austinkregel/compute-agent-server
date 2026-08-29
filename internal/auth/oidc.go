@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -21,6 +22,7 @@ import (
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"golang.org/x/oauth2"
 
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/config"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
@@ -51,6 +53,43 @@ type SessionUser struct {
 	Groups []string `json:"groups,omitempty"`
 }
 
+// claimStrings decodes a claim that may be a JSON array of strings, an array of
+// numbers, or a single scalar, into []string. Authentik emits group membership
+// as numeric team IDs; decoding straight into []string fails the entire claims
+// parse and breaks login rather than merely failing to match a group.
+type claimStrings []string
+
+func (c *claimStrings) UnmarshalJSON(data []byte) error {
+	var raw any
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*c = appendClaimValue(nil, raw)
+	return nil
+}
+
+func appendClaimValue(out []string, v any) []string {
+	switch t := v.(type) {
+	case nil:
+		return out
+	case string:
+		if s := strings.TrimSpace(t); s != "" {
+			return append(out, s)
+		}
+	case bool:
+		return append(out, strconv.FormatBool(t))
+	case float64:
+		// json.Unmarshal yields float64 for all numbers; render integral team
+		// IDs without a decimal point.
+		return append(out, strconv.FormatFloat(t, 'f', -1, 64))
+	case []any:
+		for _, item := range t {
+			out = appendClaimValue(out, item)
+		}
+	}
+	return out
+}
+
 // sessionPayload is what gets encrypted into the session cookie.
 type sessionPayload struct {
 	SessionUser
@@ -71,6 +110,34 @@ type OIDCProvider struct {
 	jwksMu   sync.Mutex
 	jwksSet  jose.JSONWebKeySet
 	jwksTime time.Time
+
+	// audit records authentication and authorization decisions. Emission lives
+	// in the middleware rather than in handlers, so a privileged route cannot
+	// be added without being audited. Nil disables recording.
+	audit *audit.Logger
+}
+
+// SetAudit attaches the audit logger. Called during server wiring.
+func (p *OIDCProvider) SetAudit(a *audit.Logger) { p.audit = a }
+
+// auditEvent records an authorization decision if auditing is enabled.
+func (p *OIDCProvider) auditEvent(r *http.Request, user *SessionUser, typ, outcome string) {
+	if p.audit == nil {
+		return
+	}
+	e := audit.Event{
+		Type:      typ,
+		Outcome:   outcome,
+		Remote:    audit.RemoteIP(r),
+		UserAgent: r.UserAgent(),
+		Action:    r.Method + " " + r.URL.Path,
+	}
+	if user != nil {
+		e.Actor = user.Sub
+		e.ActorName = user.Email
+		e.Groups = user.Groups
+	}
+	p.audit.EmitAccess(e)
 }
 
 // contextKey is used for storing session user in request context.
@@ -266,13 +333,13 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 
 	// Extract claims
 	var claims struct {
-		Sub               string   `json:"sub"`
-		Email             string   `json:"email"`
-		Name              string   `json:"name"`
-		PreferredUsername string   `json:"preferred_username"`
-		Picture           string   `json:"picture"`
-		Groups            []string `json:"groups"`
-		Roles             []string `json:"roles"`
+		Sub               string       `json:"sub"`
+		Email             string       `json:"email"`
+		Name              string       `json:"name"`
+		PreferredUsername string       `json:"preferred_username"`
+		Picture           string       `json:"picture"`
+		Groups            claimStrings `json:"groups"`
+		Roles             claimStrings `json:"roles"`
 	}
 	if err := idToken.Claims(&claims); err != nil {
 		http.Error(w, "failed to parse claims", http.StatusInternalServerError)
@@ -293,6 +360,21 @@ func (p *OIDCProvider) HandleCallback(w http.ResponseWriter, r *http.Request) {
 		Name:    name,
 		Picture: claims.Picture,
 		Groups:  mergeGroups(claims.Groups, claims.Roles),
+	}
+
+	// Record the login with the groups the IdP emitted; this is where the
+	// Authentik team ID for oidc.adminGroup can be read off.
+	if p.audit != nil {
+		p.audit.EmitAccess(audit.Event{
+			Type:      audit.TypeLoginSuccess,
+			Outcome:   audit.OutcomeAllow,
+			Actor:     user.Sub,
+			ActorName: user.Email,
+			Groups:    user.Groups,
+			Remote:    audit.RemoteIP(r),
+			UserAgent: r.UserAgent(),
+			Detail:    map[string]any{"isAdmin": p.IsAdmin(&user)},
+		})
 	}
 
 	// Create encrypted session cookie
@@ -372,6 +454,7 @@ func (p *OIDCProvider) RequireAuth(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user := p.GetSessionUser(r)
 		if user == nil {
+			p.auditEvent(r, nil, audit.TypeLoginFailure, audit.OutcomeDeny)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]any{"error": "unauthorized"})
@@ -390,6 +473,7 @@ func (p *OIDCProvider) RequireAdmin(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		user := p.GetSessionUser(r)
 		if user == nil {
+			p.auditEvent(r, nil, audit.TypeAdminDenied, audit.OutcomeDeny)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]any{"error": "unauthorized"})
@@ -397,28 +481,35 @@ func (p *OIDCProvider) RequireAdmin(next http.Handler) http.Handler {
 		}
 		if !p.IsAdmin(user) {
 			p.log.Warn("admin endpoint denied for non-admin user", "sub", user.Sub, "path", r.URL.Path)
+			p.auditEvent(r, user, audit.TypeAdminDenied, audit.OutcomeDeny)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusForbidden)
 			json.NewEncoder(w).Encode(map[string]any{"error": "forbidden: admin role required"})
 			return
 		}
+		// Recorded before the handler runs, so a handler that panics or hangs
+		// still leaves the attempt on record.
+		p.auditEvent(r, user, audit.TypeAdminAction, audit.OutcomeAllow)
 		ctx := context.WithValue(r.Context(), userContextKey, user)
 		next.ServeHTTP(w, r.WithContext(ctx))
 	})
 }
 
-// IsAdmin reports whether the user passes the admin role gate. When no admin
-// group is configured the gate is inert and every authenticated user is treated
-// as admin (preserving pre-gate behavior); a startup warning is logged in that
-// case. When a group is configured, the user must carry it in their groups/roles
-// claim. Matching is case-insensitive and whitespace-trimmed.
+// IsAdmin reports whether the user passes the admin role gate. The user must
+// carry the configured admin group in their groups/roles claim; matching is
+// case-insensitive and whitespace-trimmed.
+//
+// An unconfigured adminGroup denies everyone. There is no default value: the
+// group is identified by whatever the IdP emits, and Authentik emits numeric
+// team IDs rather than names. /api/auth/status surfaces the session's groups
+// verbatim.
 func (p *OIDCProvider) IsAdmin(user *SessionUser) bool {
 	if user == nil {
 		return false
 	}
 	group := strings.TrimSpace(p.cfg.AdminGroup)
 	if group == "" {
-		return true
+		return false
 	}
 	for _, g := range user.Groups {
 		if strings.EqualFold(strings.TrimSpace(g), group) {
@@ -508,14 +599,14 @@ func (p *OIDCProvider) ValidateAccessToken(ctx context.Context, tokenStr string)
 	// Try to verify against each key
 	var claims josejwt.Claims
 	var customClaims struct {
-		Email             string   `json:"email"`
-		Name              string   `json:"name"`
-		PreferredUsername string   `json:"preferred_username"`
-		Picture           string   `json:"picture"`
-		ClientID          string   `json:"client_id"`
-		Azp               string   `json:"azp"`
-		Groups            []string `json:"groups"`
-		Roles             []string `json:"roles"`
+		Email             string       `json:"email"`
+		Name              string       `json:"name"`
+		PreferredUsername string       `json:"preferred_username"`
+		Picture           string       `json:"picture"`
+		ClientID          string       `json:"client_id"`
+		Azp               string       `json:"azp"`
+		Groups            claimStrings `json:"groups"`
+		Roles             claimStrings `json:"roles"`
 	}
 
 	verified := false

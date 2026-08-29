@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -11,6 +12,7 @@ import (
 
 	"nhooyr.io/websocket"
 
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/auth"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/logging"
@@ -24,7 +26,11 @@ type DashboardConn struct {
 	Conn *websocket.Conn
 	User *auth.SessionUser
 	ID   string // unique connection ID
-	mu   sync.Mutex
+	// IsAdmin is resolved once at connect time from the OIDC provider and
+	// carried on the connection: relay.authorizeDashboardEvent gates
+	// privileged events on it but has no provider handle of its own.
+	IsAdmin bool
+	mu      sync.Mutex
 }
 
 // Send writes a JSON-encoded message to the dashboard connection.
@@ -32,6 +38,9 @@ func (dc *DashboardConn) Send(event string, data any) error {
 	msg, err := Encode(event, data)
 	if err != nil {
 		return err
+	}
+	if dc.Conn == nil {
+		return errors.New("dashboard connection has no socket")
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
@@ -44,6 +53,9 @@ type DashboardHandler struct {
 	log     *logging.Logger
 	oidc    *auth.OIDCProvider // nil if OIDC is disabled
 	origins []string           // allowed origins for CORS
+
+	// audit records dashboard session lifecycle. Nil disables recording.
+	audit *audit.Logger
 
 	// dashMu protects dashboards map
 	dashMu     sync.RWMutex
@@ -68,6 +80,9 @@ func NewDashboardHandler(store *state.Store, log *logging.Logger, oidc *auth.OID
 	}
 }
 
+// SetAudit attaches the audit logger. Called during server wiring.
+func (h *DashboardHandler) SetAudit(a *audit.Logger) { h.audit = a }
+
 // ServeHTTP upgrades the HTTP connection to WebSocket for dashboards.
 func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Authenticate: session cookie or Bearer token
@@ -79,6 +94,15 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"hasCookie", r.Header.Get("Cookie") != "",
 			"hasAuth", r.Header.Get("Authorization") != "",
 		)
+		if h.audit != nil {
+			h.audit.Emit(audit.Event{
+				Type:      audit.TypeLoginFailure,
+				Outcome:   audit.OutcomeDeny,
+				Remote:    audit.RemoteIP(r),
+				UserAgent: r.UserAgent(),
+				Action:    "ws/dashboard",
+			})
+		}
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
 		return
 	}
@@ -99,9 +123,10 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	connID := generateConnID()
 
 	dc := &DashboardConn{
-		Conn: conn,
-		User: user,
-		ID:   connID,
+		Conn:    conn,
+		User:    user,
+		ID:      connID,
+		IsAdmin: h.oidc.IsAdmin(user),
 	}
 
 	// Register dashboard connection
@@ -109,7 +134,20 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.dashboards[connID] = dc
 	h.dashMu.Unlock()
 
-	h.log.Info("dashboard connected", "connId", connID, "user", user.Sub, "remote", r.RemoteAddr)
+	h.log.Info("dashboard connected", "connId", connID, "user", user.Sub,
+		"isAdmin", dc.IsAdmin, "groups", user.Groups, "remote", r.RemoteAddr)
+	if h.audit != nil {
+		h.audit.EmitAccess(audit.Event{
+			Type:      audit.TypeDashboardOpen,
+			Outcome:   audit.OutcomeAllow,
+			Actor:     user.Sub,
+			ActorName: user.Email,
+			Groups:    user.Groups,
+			Remote:    audit.RemoteIP(r),
+			UserAgent: r.UserAgent(),
+			Detail:    map[string]any{"connId": connID, "isAdmin": dc.IsAdmin},
+		})
+	}
 
 	// Send initial client list
 	h.sendClientList(dc)

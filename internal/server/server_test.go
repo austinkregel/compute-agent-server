@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -24,13 +26,16 @@ func testLogger(t *testing.T) *logging.Logger {
 	return log
 }
 
-func minimalConfig() *config.Config {
+func minimalConfig(t *testing.T) *config.Config {
+	t.Helper()
 	return &config.Config{
 		Port:                8443,
 		AuthToken:           "test-token",
 		PingIntervalSec:     30,
 		PongTimeoutSec:      90,
 		AgentAuthMaxSkewSec: 600,
+		// server.New treats an unopenable audit log as fatal.
+		AuditLogFile: filepath.Join(t.TempDir(), "audit.jsonl"),
 		Logging: config.LoggingConfig{
 			Level: "error",
 		},
@@ -38,7 +43,7 @@ func minimalConfig() *config.Config {
 }
 
 func TestNew_NoOIDC(t *testing.T) {
-	cfg := minimalConfig()
+	cfg := minimalConfig(t)
 	log := testLogger(t)
 
 	srv, err := New(context.Background(), cfg, log)
@@ -63,7 +68,7 @@ func TestNew_NoOIDC(t *testing.T) {
 }
 
 func TestRun_ListensAndShutdown(t *testing.T) {
-	cfg := minimalConfig()
+	cfg := minimalConfig(t)
 	cfg.Port = 0 // let OS pick a port
 
 	log := testLogger(t)
@@ -94,8 +99,8 @@ func TestRun_ListensAndShutdown(t *testing.T) {
 	// Wait a bit for the server to start
 	time.Sleep(200 * time.Millisecond)
 
-	// Verify server is listening by making an HTTP request
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/status", cfg.Port))
+	// Probe /healthz rather than /api/status, which is behind the auth gate.
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", cfg.Port))
 	if err != nil {
 		cancel()
 		t.Fatalf("HTTP request failed: %v", err)
@@ -121,7 +126,7 @@ func TestRun_ListensAndShutdown(t *testing.T) {
 }
 
 func TestRun_AgentWebSocket(t *testing.T) {
-	cfg := minimalConfig()
+	cfg := minimalConfig(t)
 	cfg.Port = findFreePort(t)
 
 	log := testLogger(t)
@@ -172,7 +177,7 @@ func TestBuildHandler_APIPaths(t *testing.T) {
 }
 
 func TestHeartbeatAdapters(t *testing.T) {
-	cfg := minimalConfig()
+	cfg := minimalConfig(t)
 	log := testLogger(t)
 
 	srv, err := New(context.Background(), cfg, log)
@@ -201,7 +206,7 @@ func TestHeartbeatAdapters(t *testing.T) {
 }
 
 func TestCLIAdapters(t *testing.T) {
-	cfg := minimalConfig()
+	cfg := minimalConfig(t)
 	log := testLogger(t)
 
 	srv, err := New(context.Background(), cfg, log)
@@ -245,8 +250,12 @@ func TestCLIAdapters(t *testing.T) {
 	}
 }
 
-func TestRun_StatsRetrievalAPI(t *testing.T) {
-	cfg := minimalConfig()
+// With no OIDC provider there is no authentication middleware, so every
+// protected route must close. End-to-end counterpart to
+// TestAuthMiddleware_NilDeniesProtectedRoutes, exercising a running server
+// rather than a hand-built router.
+func TestRun_ProtectedRoutesDenyWithoutAuthProvider(t *testing.T) {
+	cfg := minimalConfig(t)
 	cfg.Port = findFreePort(t)
 
 	log := testLogger(t)
@@ -270,21 +279,34 @@ func TestRun_StatsRetrievalAPI(t *testing.T) {
 	go srv.Run(ctx)
 	time.Sleep(200 * time.Millisecond)
 
-	// GET /api/client/agent-1/stats
-	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/client/agent-1/stats", cfg.Port))
+	for _, path := range []string{"/api/status", "/api/client/agent-1/stats", "/api/server/exec-allowlist"} {
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d%s", cfg.Port, path))
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusUnauthorized && resp.StatusCode != http.StatusForbidden {
+			t.Errorf("GET %s = %d, want 401/403 with no auth provider", path, resp.StatusCode)
+		}
+		if strings.Contains(string(body), "my-host") {
+			t.Errorf("GET %s leaked client hostname while unauthenticated: %s", path, body)
+		}
+	}
+
+	// The probe stays reachable without credentials and still discloses
+	// nothing.
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/healthz", cfg.Port))
 	if err != nil {
-		t.Fatalf("HTTP request failed: %v", err)
+		t.Fatalf("GET /healthz failed: %v", err)
 	}
 	defer resp.Body.Close()
-
+	body, _ := io.ReadAll(resp.Body)
 	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200, got %d", resp.StatusCode)
+		t.Errorf("GET /healthz = %d, want 200", resp.StatusCode)
 	}
-
-	var body map[string]any
-	json.NewDecoder(resp.Body).Decode(&body)
-	if body["hostname"] != "my-host" {
-		t.Errorf("expected hostname 'my-host', got %v", body["hostname"])
+	if strings.TrimSpace(string(body)) != `{"status":"ok"}` {
+		t.Errorf("probe body = %q, want exactly the status object", body)
 	}
 }
 

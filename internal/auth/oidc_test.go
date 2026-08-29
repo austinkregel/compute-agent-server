@@ -618,11 +618,66 @@ func TestIsAdmin_NilUser(t *testing.T) {
 	}
 }
 
-func TestIsAdmin_NoGroupConfigured_AllowsAny(t *testing.T) {
+// An unconfigured adminGroup denies everyone. There is no correct default:
+// the IdP decides what the claim contains (Authentik emits numeric team IDs),
+// so an unset value means no admin determination is possible.
+func TestIsAdmin_NoGroupConfigured_DeniesAll(t *testing.T) {
 	mock := newMockOIDCServer(t)
-	p := setupAdminProvider(t, mock, "") // gate inert
-	if !p.IsAdmin(&SessionUser{Sub: "u1"}) {
-		t.Error("with no admin group configured, any authenticated user should pass")
+	p := setupAdminProvider(t, mock, "")
+	for _, u := range []*SessionUser{
+		{Sub: "u1"},
+		{Sub: "u2", Groups: []string{"admin"}},
+		{Sub: "u3", Groups: []string{"1", "4", "administrators"}},
+	} {
+		if p.IsAdmin(u) {
+			t.Errorf("sub %q admitted with no admin group configured", u.Sub)
+		}
+	}
+}
+
+// Authentik emits group membership as numeric team IDs, so decoding must
+// accept JSON numbers as well as strings; a []string-only decode fails the
+// whole claims parse.
+func TestClaimStrings_AcceptsNumbersAndStrings(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		json string
+		want []string
+	}{
+		{"strings", `["admin","ops"]`, []string{"admin", "ops"}},
+		{"numeric team ids", `[1,42]`, []string{"1", "42"}},
+		{"mixed", `["admin",7]`, []string{"admin", "7"}},
+		{"scalar string", `"admin"`, []string{"admin"}},
+		{"scalar number", `12`, []string{"12"}},
+		{"null", `null`, nil},
+		{"empty", `[]`, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var got claimStrings
+			if err := json.Unmarshal([]byte(tc.json), &got); err != nil {
+				t.Fatalf("unmarshal %s: %v", tc.json, err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+			for i := range tc.want {
+				if got[i] != tc.want[i] {
+					t.Errorf("got %v, want %v", got, tc.want)
+				}
+			}
+		})
+	}
+}
+
+// A numeric team ID in the claim matches an adminGroup configured as that ID.
+func TestIsAdmin_MatchesNumericTeamID(t *testing.T) {
+	mock := newMockOIDCServer(t)
+	p := setupAdminProvider(t, mock, "42")
+	if !p.IsAdmin(&SessionUser{Sub: "u1", Groups: []string{"7", "42"}}) {
+		t.Error("numeric team ID 42 should match adminGroup 42")
+	}
+	if p.IsAdmin(&SessionUser{Sub: "u2", Groups: []string{"7", "421"}}) {
+		t.Error("421 must not match adminGroup 42")
 	}
 }
 

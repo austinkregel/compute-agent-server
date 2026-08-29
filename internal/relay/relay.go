@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/database"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/backup-server/internal/ws"
@@ -63,6 +64,27 @@ func (r *Relay) updatePlanFile(planID string, update map[string]any) {
 	os.WriteFile(p, b, 0640)
 }
 
+// auditDetail extracts the fields recorded for a privileged event. It is an
+// allowlist rather than a payload dump: file contents and shell input pass
+// through here and must not be written to the log.
+func auditDetail(event string, data map[string]any) map[string]any {
+	out := map[string]any{}
+	for _, k := range []string{"path", "command", "sessionId", "requestId", "variant", "mode", "newPath"} {
+		if v, ok := data[k]; ok {
+			if s, isStr := v.(string); isStr && len(s) > 512 {
+				s = s[:512] + "…"
+				out[k] = s
+				continue
+			}
+			out[k] = v
+		}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
 // DashSender abstracts the dashboard message sending operations.
 // Satisfied by *ws.DashboardHandler and by test mocks.
 type DashSender interface {
@@ -72,8 +94,13 @@ type DashSender interface {
 
 // Relay bridges dashboard events to agents and routes agent responses back.
 type Relay struct {
-	store      *state.Store
-	log        *logging.Logger
+	store *state.Store
+	log   *logging.Logger
+
+	// audit records privileged dashboard events at the authorization gate.
+	// Nil disables recording.
+	audit *audit.Logger
+
 	dash       DashSender
 	backupsDir string
 
@@ -206,6 +233,25 @@ func (r *Relay) ResolveGenericPending(token string, data map[string]any) bool {
 
 // New creates a new Relay instance.
 // backupsDir is the directory for persisting backup plan JSON files (e.g., "backups").
+// SetAudit attaches the audit logger. Called during server wiring.
+func (r *Relay) SetAudit(a *audit.Logger) { r.audit = a }
+
+// sendAs forwards a command to an agent attributed to the person behind the
+// dashboard session. Handlers acting on a user's instruction use this rather
+// than ws.SendSignedCommand so the agent's own logs record who caused it.
+func (r *Relay) sendAs(dc *ws.DashboardConn, clientID, event string, payload any) bool {
+	return ws.SendSignedCommandAs(r.store, clientID, event, payload, actorOf(dc), r.log)
+}
+
+// actorOf resolves the principal for a dashboard session. A session with no
+// resolved user is attributed to the control plane rather than left blank.
+func actorOf(dc *ws.DashboardConn) string {
+	if dc == nil || dc.User == nil || dc.User.Sub == "" {
+		return ws.ActorSystem
+	}
+	return dc.User.Sub
+}
+
 func New(store *state.Store, log *logging.Logger, dash DashSender, backupsDir string) *Relay {
 	if backupsDir != "" {
 		os.MkdirAll(backupsDir, 0750)
@@ -224,10 +270,99 @@ func New(store *state.Store, log *logging.Logger, dash DashSender, backupsDir st
 	}
 }
 
+// unprivilegedDashboardEvents is the closed set of dashboard events any
+// authenticated user may send. Everything else requires the admin role.
+//
+// It is an allowlist of harmless events rather than a denylist of dangerous
+// ones, so an event type added later is privileged until classified otherwise.
+// The events routed here reach an agent as root: shell_start opens a PTY,
+// exec_request runs a command, the file_* events write and delete on the
+// managed machine. They deliver the same capabilities as /api/server/*, so
+// gating the REST API alone leaves that gate bypassable.
+var unprivilegedDashboardEvents = map[string]bool{
+	// Read-only inspection of an agent's filesystem and logs.
+	"dir_list_request": true,
+	"log_tail_start":   true,
+	"log_tail_stop":    true,
+
+	// Backup planning is a dry run; backup_approve (which executes it) is not
+	// listed and therefore requires admin.
+	"backup_plan_request": true,
+
+	// Kiosk layout reads.
+	"kiosk_get_layouts": true,
+
+	// Version reporting.
+	"check_updates_request": true,
+
+	// Docker/Swarm read-only inventory. The mutating swarm_init/join/leave
+	// events are absent, as are SMS reads: /api/client/{id}/sms/* is
+	// admin-gated, and exempting them here would reopen that over the
+	// WebSocket.
+	"swarm_info_request":         true,
+	"swarm_node_list_request":    true,
+	"swarm_service_list_request": true,
+	"swarm_service_logs_request": true,
+	"swarm_network_list_request": true,
+	"swarm_stack_list_request":   true,
+}
+
+// authorizeDashboardEvent reports whether dc may send this event, emitting an
+// error back to the dashboard and an audit line when it may not.
+func (r *Relay) authorizeDashboardEvent(dc *ws.DashboardConn, event string, data map[string]any) bool {
+	sub, name := "", ""
+	var groups []string
+	if dc.User != nil {
+		sub, name, groups = dc.User.Sub, dc.User.Email, dc.User.Groups
+	}
+	clientID, _ := data["clientId"].(string)
+
+	if dc.IsAdmin || unprivilegedDashboardEvents[event] {
+		// Only privileged events are recorded; read-only inventory polling
+		// would swamp the log.
+		if r.audit != nil && !unprivilegedDashboardEvents[event] {
+			r.audit.EmitAccess(audit.Event{
+				Type:      audit.TypePrivilegedEvent,
+				Outcome:   audit.OutcomeAllow,
+				Actor:     sub,
+				ActorName: name,
+				Groups:    groups,
+				ClientID:  clientID,
+				Action:    event,
+				Detail:    auditDetail(event, data),
+			})
+		}
+		return true
+	}
+
+	r.log.Warn("dashboard event denied: admin role required",
+		"event", event, "sub", sub, "connId", dc.ID)
+	if r.audit != nil {
+		r.audit.EmitAccess(audit.Event{
+			Type:      audit.TypeEventDenied,
+			Outcome:   audit.OutcomeDeny,
+			Actor:     sub,
+			ActorName: name,
+			Groups:    groups,
+			ClientID:  clientID,
+			Action:    event,
+		})
+	}
+	r.dash.SendTo(dc.ID, "error", map[string]any{
+		"event": event,
+		"error": "forbidden: admin role required",
+	})
+	return false
+}
+
 // HandleDashboardEvent processes an event from a dashboard connection.
 func (r *Relay) HandleDashboardEvent(dc *ws.DashboardConn, msg *ws.Message) {
 	var data map[string]any
 	json.Unmarshal(msg.Data, &data)
+
+	if !r.authorizeDashboardEvent(dc, msg.Event, data) {
+		return
+	}
 
 	switch msg.Event {
 	// Shell
@@ -539,6 +674,8 @@ func (r *Relay) CleanupDashboard(dc *ws.DashboardConn) {
 	r.shellMu.Lock()
 	for sessionID, sess := range r.shellSessions {
 		if sess.DashConnID == connID {
+			// Disconnect-driven cleanup, not a user instruction: attributed to
+			// the control plane rather than to the departed user.
 			ws.SendSignedCommand(r.store, sess.ClientID, "shell_close",
 				map[string]string{"session": sessionID}, r.log)
 			delete(r.shellSessions, sessionID)
@@ -603,8 +740,8 @@ func (r *Relay) handleShellStart(dc *ws.DashboardConn, data map[string]any) {
 	}
 	r.shellMu.Unlock()
 
-	ws.SendSignedCommand(r.store, clientID, "shell_start",
-		map[string]string{"session": sessionID}, r.log)
+	r.sendAs(dc, clientID, "shell_start",
+		map[string]string{"session": sessionID})
 
 	r.dash.SendTo(dc.ID, "shell_started", map[string]any{
 		"session":  sessionID,
@@ -622,8 +759,8 @@ func (r *Relay) handleShellInput(dc *ws.DashboardConn, data map[string]any) {
 		return
 	}
 
-	ws.SendSignedCommand(r.store, sess.ClientID, "shell_input",
-		map[string]any{"session": sessionID, "data": data["data"]}, r.log)
+	r.sendAs(dc, sess.ClientID, "shell_input",
+		map[string]any{"session": sessionID, "data": data["data"]})
 }
 
 func (r *Relay) handleShellResize(dc *ws.DashboardConn, data map[string]any) {
@@ -635,8 +772,8 @@ func (r *Relay) handleShellResize(dc *ws.DashboardConn, data map[string]any) {
 		return
 	}
 
-	ws.SendSignedCommand(r.store, sess.ClientID, "shell_resize",
-		map[string]any{"session": sessionID, "cols": data["cols"], "rows": data["rows"]}, r.log)
+	r.sendAs(dc, sess.ClientID, "shell_resize",
+		map[string]any{"session": sessionID, "cols": data["cols"], "rows": data["rows"]})
 }
 
 func (r *Relay) handleShellClose(dc *ws.DashboardConn, data map[string]any) {
@@ -651,8 +788,8 @@ func (r *Relay) handleShellClose(dc *ws.DashboardConn, data map[string]any) {
 		return
 	}
 
-	ws.SendSignedCommand(r.store, sess.ClientID, "shell_close",
-		map[string]string{"session": sessionID}, r.log)
+	r.sendAs(dc, sess.ClientID, "shell_close",
+		map[string]string{"session": sessionID})
 
 	r.dash.SendTo(dc.ID, "shell_closed", map[string]any{
 		"session": sessionID,
@@ -727,8 +864,8 @@ func (r *Relay) handleLogTailStart(dc *ws.DashboardConn, data map[string]any) {
 	}
 	r.logMu.Unlock()
 
-	ws.SendSignedCommand(r.store, clientID, "log_tail_start",
-		map[string]any{"session": sessionID, "lines": lines}, r.log)
+	r.sendAs(dc, clientID, "log_tail_start",
+		map[string]any{"session": sessionID, "lines": lines})
 
 	r.dash.SendTo(dc.ID, "log_tail_started", map[string]any{
 		"session":  sessionID,
@@ -746,16 +883,16 @@ func (r *Relay) handleLogTailStop(dc *ws.DashboardConn, data map[string]any) {
 	if sessionID != "" {
 		// Stop specific session
 		if sess, ok := r.logSessions[sessionID]; ok && sess.DashConnID == dc.ID {
-			ws.SendSignedCommand(r.store, sess.ClientID, "log_tail_stop",
-				map[string]string{"session": sessionID}, r.log)
+			r.sendAs(dc, sess.ClientID, "log_tail_stop",
+				map[string]string{"session": sessionID})
 			delete(r.logSessions, sessionID)
 		}
 	} else if clientID != "" {
 		// Stop all sessions for this client owned by this dashboard
 		for sid, sess := range r.logSessions {
 			if sess.ClientID == clientID && sess.DashConnID == dc.ID {
-				ws.SendSignedCommand(r.store, clientID, "log_tail_stop",
-					map[string]string{"session": sid}, r.log)
+				r.sendAs(dc, clientID, "log_tail_stop",
+					map[string]string{"session": sid})
 				delete(r.logSessions, sid)
 			}
 		}
@@ -830,7 +967,7 @@ func (r *Relay) handleBackupPlanRequest(dc *ws.DashboardConn, data map[string]an
 	payload := copyMap(data)
 	payload["planId"] = planID
 	delete(payload, "clientId")
-	ws.SendSignedCommand(r.store, clientID, "backup_plan", payload, r.log)
+	r.sendAs(dc, clientID, "backup_plan", payload)
 
 	r.dash.SendTo(dc.ID, "backup_plan_dispatched", map[string]any{
 		"clientId": clientID,
@@ -854,7 +991,7 @@ func (r *Relay) handleBackupApprove(dc *ws.DashboardConn, data map[string]any) {
 	payload := copyMap(job.Job)
 	payload["planId"] = planID
 	delete(payload, "clientId")
-	ws.SendSignedCommand(r.store, job.ClientID, "backup_start", payload, r.log)
+	r.sendAs(dc, job.ClientID, "backup_start", payload)
 
 	r.dash.Broadcast("backup_started", map[string]any{
 		"clientId": job.ClientID,
@@ -991,7 +1128,7 @@ func (r *Relay) handleFilePutStart(dc *ws.DashboardConn, data map[string]any) {
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "file_put_start", payload, r.log)
+	r.sendAs(dc, clientID, "file_put_start", payload)
 
 	r.dash.SendTo(dc.ID, "file_put_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1032,7 +1169,7 @@ func (r *Relay) handleFileGetRequest(dc *ws.DashboardConn, data map[string]any) 
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "file_get_request", payload, r.log)
+	r.sendAs(dc, clientID, "file_get_request", payload)
 
 	r.dash.SendTo(dc.ID, "file_get_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1093,8 +1230,8 @@ func (r *Relay) handleFilePutChunk(dc *ws.DashboardConn, data map[string]any) {
 		return
 	}
 
-	ws.SendSignedCommand(r.store, clientID, "file_put_chunk",
-		map[string]any{"requestId": reqID, "offset": data["offset"], "data": data["data"]}, r.log)
+	r.sendAs(dc, clientID, "file_put_chunk",
+		map[string]any{"requestId": reqID, "offset": data["offset"], "data": data["data"]})
 
 	_ = op // used above
 }
@@ -1112,8 +1249,8 @@ func (r *Relay) handleFilePutFinish(dc *ws.DashboardConn, data map[string]any) {
 	}
 	r.fileMu.Unlock()
 
-	ws.SendSignedCommand(r.store, clientID, "file_put_finish",
-		map[string]any{"requestId": reqID, "checksum": data["checksum"]}, r.log)
+	r.sendAs(dc, clientID, "file_put_finish",
+		map[string]any{"requestId": reqID, "checksum": data["checksum"]})
 }
 
 func (r *Relay) handleFilePutResult(clientID string, data map[string]any) {
@@ -1169,7 +1306,7 @@ func (r *Relay) handleFileDeleteRequest(dc *ws.DashboardConn, data map[string]an
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "file_delete_request", payload, r.log)
+	r.sendAs(dc, clientID, "file_delete_request", payload)
 
 	r.dash.SendTo(dc.ID, "file_delete_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1224,7 +1361,7 @@ func (r *Relay) handleFileChmodRequest(dc *ws.DashboardConn, data map[string]any
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "file_chmod_request", payload, r.log)
+	r.sendAs(dc, clientID, "file_chmod_request", payload)
 
 	r.dash.SendTo(dc.ID, "file_chmod_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1275,7 +1412,7 @@ func (r *Relay) handleFileMkdirRequest(dc *ws.DashboardConn, data map[string]any
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "file_mkdir_request", payload, r.log)
+	r.sendAs(dc, clientID, "file_mkdir_request", payload)
 
 	r.dash.SendTo(dc.ID, "file_mkdir_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1328,7 +1465,7 @@ func (r *Relay) handleFileRenameRequest(dc *ws.DashboardConn, data map[string]an
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "file_rename_request", payload, r.log)
+	r.sendAs(dc, clientID, "file_rename_request", payload)
 
 	r.dash.SendTo(dc.ID, "file_rename_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1381,7 +1518,7 @@ func (r *Relay) handleDirListRequest(dc *ws.DashboardConn, data map[string]any) 
 	if data["port"] == nil {
 		payload["port"] = 22
 	}
-	ws.SendSignedCommand(r.store, clientID, "dir_list_request", payload, r.log)
+	r.sendAs(dc, clientID, "dir_list_request", payload)
 
 	r.dash.SendTo(dc.ID, "dir_list_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1414,7 +1551,7 @@ func (r *Relay) handleExecRequest(dc *ws.DashboardConn, data map[string]any) {
 
 	payload := copyMap(data)
 	payload["requestId"] = reqID
-	ws.SendSignedCommand(r.store, clientID, "exec_request", payload, r.log)
+	r.sendAs(dc, clientID, "exec_request", payload)
 
 	r.dash.SendTo(dc.ID, "exec_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1425,14 +1562,14 @@ func (r *Relay) handleExecRequest(dc *ws.DashboardConn, data map[string]any) {
 // handleExecCancel forwards a fire-and-forget cancel for an in-flight exec to the
 // agent, which kills the running process. The result still arrives via the
 // original exec_result, so nothing to route back here.
-func (r *Relay) handleExecCancel(_ *ws.DashboardConn, data map[string]any) {
+func (r *Relay) handleExecCancel(dc *ws.DashboardConn, data map[string]any) {
 	clientID := str(data, "clientId")
 	if clientID == "" || !r.store.HasClient(clientID) {
 		return
 	}
-	ws.SendSignedCommand(r.store, clientID, "exec_cancel", map[string]any{
+	r.sendAs(dc, clientID, "exec_cancel", map[string]any{
 		"requestId": str(data, "requestId"),
-	}, r.log)
+	})
 }
 
 func (r *Relay) handleExecResult(clientID string, data map[string]any) {
@@ -1515,8 +1652,8 @@ func (r *Relay) handleKioskSet(dc *ws.DashboardConn, data map[string]any) {
 		cleanContent["units"] = units
 	}
 
-	ws.SendSignedCommand(r.store, clientID, "kiosk_set",
-		map[string]any{"requestId": reqID, "content": cleanContent}, r.log)
+	r.sendAs(dc, clientID, "kiosk_set",
+		map[string]any{"requestId": reqID, "content": cleanContent})
 
 	r.dash.SendTo(dc.ID, "kiosk_set_dispatched", map[string]any{
 		"clientId":  clientID,
@@ -1566,7 +1703,7 @@ func (r *Relay) handleKioskSaveLayout(dc *ws.DashboardConn, data map[string]any)
 		payload["units"] = units
 	}
 
-	ws.SendSignedCommand(r.store, clientID, "kiosk_save_layout", payload, r.log)
+	r.sendAs(dc, clientID, "kiosk_save_layout", payload)
 }
 
 func (r *Relay) handleKioskGetLayouts(dc *ws.DashboardConn, data map[string]any) {
@@ -1576,7 +1713,7 @@ func (r *Relay) handleKioskGetLayouts(dc *ws.DashboardConn, data map[string]any)
 		return
 	}
 
-	ws.SendSignedCommand(r.store, clientID, "kiosk_get_layouts", map[string]any{}, r.log)
+	r.sendAs(dc, clientID, "kiosk_get_layouts", map[string]any{})
 }
 
 // --- Variant handlers ---
@@ -1596,12 +1733,12 @@ func (r *Relay) handleSwitchVariant(dc *ws.DashboardConn, data map[string]any) {
 
 	tag := str(data, "tag")
 
-	ws.SendSignedCommand(r.store, clientID, "switch_variant",
+	r.sendAs(dc, clientID, "switch_variant",
 		map[string]any{
 			"variant": variant,
 			"repo":    "austinkregel/compute-agent",
 			"tag":     tag,
-		}, r.log)
+		})
 
 	r.dash.SendTo(dc.ID, "variant_switch_dispatched", map[string]any{
 		"clientId": clientID,
@@ -1633,8 +1770,8 @@ func (r *Relay) handleCheckUpdates(dc *ws.DashboardConn, data map[string]any) {
 		return
 	}
 
-	ws.SendSignedCommand(r.store, clientID, "check_updates",
-		map[string]any{"at": nowISO()}, r.log)
+	r.sendAs(dc, clientID, "check_updates",
+		map[string]any{"at": nowISO()})
 
 	r.dash.SendTo(dc.ID, "check_updates_dispatched", map[string]any{
 		"clientId": clientID,
@@ -1814,7 +1951,7 @@ func (r *Relay) handleDockerDashboardEvent(dc *ws.DashboardConn, event string, d
 	delete(payload, "clientId")
 
 	agentCommand := strings.TrimSuffix(event, "_request")
-	ws.SendSignedCommand(r.store, clientID, agentCommand, payload, r.log)
+	r.sendAs(dc, clientID, agentCommand, payload)
 
 	r.dash.SendTo(dc.ID, event+"_dispatched", map[string]any{
 		"clientId": clientID,

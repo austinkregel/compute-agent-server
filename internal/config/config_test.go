@@ -92,7 +92,7 @@ func TestLoad_EnvOverrideDatabaseDSN(t *testing.T) {
 	t.Setenv("DATABASE_DSN", "postgres://user:pass@localhost/db")
 	t.Setenv("SMS_ENCRYPTION_KEY_FILE", "/etc/backup-server/sms.key")
 
-	p := writeTestConfig(t, `{"port": 8443, "authToken": "secret"}`)
+	p := writeTestConfig(t, `{"port": 8443, "authToken": "secret", "insecureAllowUnauthenticated": true}`)
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -107,7 +107,7 @@ func TestLoad_EnvOverrideDatabaseDSN(t *testing.T) {
 
 func TestLoad_ExecAllowlistEnvOverride(t *testing.T) {
 	t.Setenv("EXEC_ALLOWED_COMMANDS", "git, ls ,  make")
-	p := writeTestConfig(t, `{"port":8443,"authToken":"secret"}`)
+	p := writeTestConfig(t, `{"port":8443,"authToken":"secret","insecureAllowUnauthenticated":true}`)
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load() error = %v", err)
@@ -395,5 +395,29 @@ func TestLoad_Logging(t *testing.T) {
 	}
 	if cfg.Logging.Level != "debug" {
 		t.Errorf("Logging.Level = %q", cfg.Logging.Level)
+	}
+}
+
+// Running with oidc.enabled false leaves the REST API and dashboard with no
+// authentication middleware, so it must be an explicit choice.
+func TestValidate_RefusesUnauthenticatedByDefault(t *testing.T) {
+	p := writeTestConfig(t, `{"port":8443,"authToken":"secret"}`)
+	if _, err := Load(p); err == nil {
+		t.Fatal("Load() succeeded with OIDC disabled and no explicit opt-in; want refusal")
+	}
+}
+
+func TestValidate_AllowsUnauthenticatedWhenOptedIn(t *testing.T) {
+	p := writeTestConfig(t, `{"port":8443,"authToken":"secret","insecureAllowUnauthenticated":true}`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("Load() error with explicit opt-in = %v", err)
+	}
+}
+
+func TestValidate_EnvCanOptIn(t *testing.T) {
+	t.Setenv("INSECURE_ALLOW_UNAUTHENTICATED", "true")
+	p := writeTestConfig(t, `{"port":8443,"authToken":"secret"}`)
+	if _, err := Load(p); err != nil {
+		t.Fatalf("Load() error with env opt-in = %v", err)
 	}
 }

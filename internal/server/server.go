@@ -14,6 +14,7 @@ import (
 
 	"github.com/austinkregel/backup-server/internal/allowlist"
 	"github.com/austinkregel/backup-server/internal/api"
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/auth"
 	servercli "github.com/austinkregel/backup-server/internal/cli"
 	"github.com/austinkregel/backup-server/internal/config"
@@ -42,6 +43,7 @@ type Server struct {
 	oidc       *auth.OIDCProvider
 	allowlist  *allowlist.Store
 	sms        *database.SMSStore
+	audit      *audit.Logger
 
 	// EnableCLI controls whether the interactive CLI runs. Defaults to true.
 	EnableCLI bool
@@ -80,6 +82,18 @@ func New(ctx context.Context, cfg *config.Config, log *logging.Logger) (*Server,
 		s.oidc = oidcProvider
 	}
 
+	// Audit trail. Opened before anything that can be audited, and fatal if it
+	// cannot be opened, so a bad path or a full disk does not silently leave
+	// the control plane unaudited.
+	auditLog, err := audit.Open(cfg.AuditLogFile)
+	if err != nil {
+		return nil, fmt.Errorf("audit log: %w", err)
+	}
+	s.audit = auditLog
+	if s.oidc != nil {
+		s.oidc.SetAudit(auditLog)
+	}
+
 	// Canonical exec allowlist (persisted; seeded from config on first run).
 	allowlistPath := os.Getenv("EXEC_ALLOWLIST_STATE_PATH")
 	if allowlistPath == "" {
@@ -104,9 +118,12 @@ func New(ctx context.Context, cfg *config.Config, log *logging.Logger) (*Server,
 
 	// Dashboard handler
 	s.dashboard = ws.NewDashboardHandler(store, log, s.oidc, cfg.DashboardAllowedOrigins)
+	s.dashboard.SetAudit(auditLog)
+	s.agents.SetAudit(auditLog)
 
 	// Relay (with backup plan persistence directory)
 	s.relayer = relay.New(store, log, s.dashboard, "backups")
+	s.relayer.SetAudit(auditLog)
 	if s.sms != nil {
 		s.relayer.SetSMSStore(s.sms)
 	}
@@ -240,12 +257,15 @@ func (s *Server) Run(ctx context.Context) error {
 	if tlspkg.CertDirExists(certDir) {
 		tlsCfg, cancel, err := tlspkg.NewTLSConfigWithWatcher(certDir, s.log)
 		if err != nil {
-			s.log.Warn("TLS cert load failed, falling back to plain HTTP", "error", err)
-		} else {
-			cancelTLSWatch = cancel
-			ln = cryptotls.NewListener(ln, tlsCfg)
-			s.log.Info("TLS enabled", "certDir", certDir)
+			// Certs are present, so TLS was intended. Downgrading to cleartext
+			// would serve agent tokens, shell traffic, and SMS bodies in the
+			// clear because a cert expired.
+			_ = ln.Close()
+			return fmt.Errorf("TLS certs present in %s but unusable (refusing to downgrade to plain HTTP): %w", certDir, err)
 		}
+		cancelTLSWatch = cancel
+		ln = cryptotls.NewListener(ln, tlsCfg)
+		s.log.Info("TLS enabled", "certDir", certDir)
 	} else {
 		s.log.Info("no TLS certs found, running plain HTTP", "certDir", certDir)
 	}
@@ -344,13 +364,17 @@ func (s *Server) buildHandler() http.Handler {
 		Relay:     s.relayer,
 		Allowlist: s.allowlist,
 		SMS:       s.sms,
+		Audit:     s.audit,
+		AuditPath: s.cfg.AuditLogFile,
 		StartTime: time.Now(),
 	}
 	if s.oidc != nil {
 		deps.AuthStatusHandler = s.oidc.HandleAuthStatus
 		deps.AdminMiddleware = s.oidc.RequireAdmin
 		if s.cfg.OIDC.AdminGroup == "" {
-			s.log.Warn("oidc.adminGroup is not set: admin endpoints (exec-allowlist, restart/shutdown) are NOT role-gated — any authenticated user can call them; set oidc.adminGroup to enforce")
+			s.log.Error("oidc.adminGroup is not set: ALL admin actions are denied, including the remote shell. " +
+				"Log in and read your group from /api/auth/status, then set oidc.adminGroup to that value " +
+				"(Authentik emits numeric team IDs, not group names)")
 		}
 	}
 	apiRouter := api.NewRouter(deps, authMW)
@@ -412,8 +436,13 @@ func (f *spaFallback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		f.primary.ServeHTTP(w, r)
 		return
 	}
-	// Require OIDC auth for SPA routes — redirect unauthenticated users to login
-	if f.oidc != nil && f.oidc.GetSessionUser(r) == nil {
+	// Require OIDC auth for SPA routes. A nil provider means authentication was
+	// never configured, and there is no login to redirect to.
+	if f.oidc == nil {
+		http.Error(w, "unauthorized: no authentication provider configured", http.StatusUnauthorized)
+		return
+	}
+	if f.oidc.GetSessionUser(r) == nil {
 		http.Redirect(w, r, "/auth/login", http.StatusFound)
 		return
 	}
@@ -421,7 +450,7 @@ func (f *spaFallback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func isAPIPaths(path string) bool {
-	prefixes := []string{"/api/", "/auth/", "/ws/", "/login", "/github-version-release"}
+	prefixes := []string{"/api/", "/auth/", "/ws/", "/login", "/healthz", "/github-version-release"}
 	for _, p := range prefixes {
 		if len(path) >= len(p) && path[:len(p)] == p {
 			return true
