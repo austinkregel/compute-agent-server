@@ -2,10 +2,12 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func tempLog(t *testing.T) (*Logger, string) {
@@ -218,5 +220,98 @@ func TestEventJSONRoundTrip(t *testing.T) {
 	}
 	if e.Detail["k"] != "v" {
 		t.Errorf("detail lost in round trip: %+v", e.Detail)
+	}
+}
+
+// An unauthenticated caller must not be able to drive unbounded appends: the
+// same key inside the window is counted rather than written.
+func TestEmitThrottled_SuppressesRepeats(t *testing.T) {
+	l, path := tempLog(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return base }
+
+	for i := 0; i < 500; i++ {
+		l.EmitThrottled(Event{Type: TypeLoginFailure, Remote: "203.0.113.5"})
+	}
+
+	events, _ := Read(path, 0)
+	if len(events) != 1 {
+		t.Fatalf("wrote %d records for 500 identical attempts, want 1", len(events))
+	}
+
+	// After the window, the next admitted record reports what was dropped.
+	l.now = func() time.Time { return base.Add(ThrottleWindow + time.Second) }
+	l.EmitThrottled(Event{Type: TypeLoginFailure, Remote: "203.0.113.5"})
+
+	events, _ = Read(path, 0)
+	if len(events) != 2 {
+		t.Fatalf("wrote %d records, want 2 after the window elapsed", len(events))
+	}
+	if got := events[1].Detail["suppressed"]; got != float64(499) {
+		t.Errorf("suppressed = %v, want 499 — the log must say what it did not write", got)
+	}
+	if res := Verify(events); !res.Valid {
+		t.Errorf("throttling broke the chain: %+v", res)
+	}
+}
+
+// Varying the source address must not defeat the bound, or a distributed scan
+// reintroduces the same amplification.
+func TestEmitThrottled_BoundsDistinctKeys(t *testing.T) {
+	l, path := tempLog(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return base }
+
+	for i := 0; i < maxThrottleKeys*4; i++ {
+		l.EmitThrottled(Event{
+			Type:   TypeLoginFailure,
+			Remote: fmt.Sprintf("10.%d.%d.1", i/256%256, i%256),
+		})
+	}
+
+	events, _ := Read(path, 0)
+	if len(events) > maxThrottleKeys+1 {
+		t.Errorf("wrote %d records for %d distinct sources; want at most %d",
+			len(events), maxThrottleKeys*4, maxThrottleKeys+1)
+	}
+}
+
+// Distinct keys inside the window are each recorded once — throttling must not
+// collapse different actors or networks into one another.
+func TestEmitThrottled_DistinguishesKeys(t *testing.T) {
+	l, path := tempLog(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return base }
+
+	l.EmitThrottled(Event{Type: TypeLoginFailure, Remote: "203.0.113.5"})
+	l.EmitThrottled(Event{Type: TypeLoginFailure, Remote: "198.51.100.5"})
+	l.EmitThrottled(Event{Type: TypeAgentAuthFail, Remote: "203.0.113.5"})
+	l.EmitThrottled(Event{Type: TypeLoginFailure, Remote: "203.0.113.9"}) // same /24 as the first
+
+	events, _ := Read(path, 0)
+	if len(events) != 3 {
+		t.Fatalf("wrote %d records, want 3 (two networks + one other type)", len(events))
+	}
+}
+
+// Authenticated and privileged emission must not be throttled.
+func TestEmitAccess_NotThrottled(t *testing.T) {
+	l, path := tempLog(t)
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	l.now = func() time.Time { return base }
+
+	for i := 0; i < 50; i++ {
+		l.EmitAccess(Event{Type: TypePrivilegedEvent, Actor: "alice", Remote: "10.0.1.5", Action: "shell_start"})
+	}
+
+	events, _ := Read(path, 0)
+	var privileged int
+	for _, e := range events {
+		if e.Type == TypePrivilegedEvent {
+			privileged++
+		}
+	}
+	if privileged != 50 {
+		t.Errorf("recorded %d privileged events, want all 50", privileged)
 	}
 }

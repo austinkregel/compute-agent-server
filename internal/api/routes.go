@@ -226,23 +226,29 @@ func handleAuditGet(deps Deps) http.HandlerFunc {
 				limit = n
 			}
 		}
-		events, err := audit.Read(deps.AuditPath, limit)
+		// Read the whole log, then filter, then limit. Limiting first would
+		// apply the type filter to only the most recent records and report
+		// nothing whenever the matches lie further back.
+		all, err := audit.Read(deps.AuditPath, 0)
 		if err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "audit log unreadable"})
 			return
 		}
+		events := all
 		if t := strings.TrimSpace(r.URL.Query().Get("type")); t != "" {
-			filtered := events[:0:0]
-			for _, e := range events {
+			filtered := make([]audit.Event, 0, len(all))
+			for _, e := range all {
 				if e.Type == t {
 					filtered = append(filtered, e)
 				}
 			}
 			events = filtered
 		}
+		if len(events) > limit {
+			events = events[len(events)-limit:]
+		}
 		// Verify the whole chain, not just the returned window: a break
 		// anywhere invalidates the window too.
-		all, _ := audit.Read(deps.AuditPath, 0)
 		writeJSON(w, http.StatusOK, map[string]any{
 			"events": events,
 			"chain":  audit.Verify(all),

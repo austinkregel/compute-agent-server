@@ -59,6 +59,18 @@ const (
 	OutcomeDeny  = "deny"
 )
 
+// ThrottleWindow bounds how often an identical (type, actor, network) event is
+// recorded. Events reachable without credentials go through EmitThrottled:
+// otherwise anyone able to reach the port can drive unbounded appends and
+// fsyncs, filling the disk and stalling emission for everything else.
+const ThrottleWindow = time.Minute
+
+// maxThrottleKeys bounds both memory and the per-window write count when the
+// source varies, as in a distributed scan. Past this many distinct keys all
+// further ones collapse onto a single shared bucket, so the write rate stays
+// bounded no matter how many sources are involved.
+const maxThrottleKeys = 1024
+
 // Event is a single audit record. Fields are flat and stable.
 type Event struct {
 	Seq       uint64         `json:"seq"`
@@ -95,6 +107,17 @@ type Logger struct {
 	// onEvent is invoked after a successful append, to surface records without
 	// re-reading the file.
 	onEvent func(Event)
+
+	// throttle tracks recently-recorded keys for EmitThrottled.
+	throttle map[string]*throttleState
+
+	// now is overridable so throttling can be tested without sleeping.
+	now func() time.Time
+}
+
+type throttleState struct {
+	last       time.Time
+	suppressed int
 }
 
 // Open opens (creating if needed) the audit log at path and recovers the chain
@@ -110,7 +133,12 @@ func Open(path string) (*Logger, error) {
 		}
 	}
 
-	l := &Logger{path: path, seen: make(map[string]bool)}
+	l := &Logger{
+		path:     path,
+		seen:     make(map[string]bool),
+		throttle: make(map[string]*throttleState),
+		now:      time.Now,
+	}
 
 	// Recover chain state and the first-seen set by replaying the existing log.
 	// Replaying rather than keeping a sidecar file leaves one source of truth,
@@ -168,7 +196,7 @@ func (l *Logger) emitLocked(e Event) Event {
 	l.seq++
 	e.Seq = l.seq
 	if e.Time == "" {
-		e.Time = time.Now().UTC().Format(time.RFC3339Nano)
+		e.Time = l.now().UTC().Format(time.RFC3339Nano)
 	}
 	e.Prev = l.prev
 	e.Hash = hashEvent(e)
@@ -207,6 +235,47 @@ func (l *Logger) EmitAccess(e Event) Event {
 		})
 	}
 	return l.emitLocked(e)
+}
+
+// EmitThrottled records an event unless an identical (type, actor, network) key
+// was already recorded within ThrottleWindow, in which case it is counted and
+// dropped. The next admitted event for that key carries the suppressed count,
+// so the log stays honest about what it did not write.
+//
+// Use this for anything reachable without credentials. Authenticated and
+// privileged events go through Emit or EmitAccess and are never dropped.
+func (l *Logger) EmitThrottled(e Event) (Event, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	key := e.Type + "|" + e.Actor + "|" + networkPrefix(e.Remote)
+	st, ok := l.throttle[key]
+	if !ok {
+		if len(l.throttle) >= maxThrottleKeys {
+			key = e.Type + "|overflow"
+			st, ok = l.throttle[key]
+		}
+		if !ok {
+			st = &throttleState{}
+			l.throttle[key] = st
+		}
+	}
+
+	now := l.now()
+	if !st.last.IsZero() && now.Sub(st.last) < ThrottleWindow {
+		st.suppressed++
+		return Event{}, false
+	}
+
+	if st.suppressed > 0 {
+		if e.Detail == nil {
+			e.Detail = map[string]any{}
+		}
+		e.Detail["suppressed"] = st.suppressed
+		st.suppressed = 0
+	}
+	st.last = now
+	return l.emitLocked(e), true
 }
 
 // hashEvent computes the chain hash over the record with Hash zeroed, encoding

@@ -121,6 +121,11 @@ type OIDCProvider struct {
 func (p *OIDCProvider) SetAudit(a *audit.Logger) { p.audit = a }
 
 // auditEvent records an authorization decision if auditing is enabled.
+//
+// Events with no resolved session are reachable by anyone who can reach the
+// port, so they go through EmitThrottled: an unauthenticated request must not
+// be able to drive an unbounded number of appends and fsyncs. Events carrying a
+// resolved user are recorded in full.
 func (p *OIDCProvider) auditEvent(r *http.Request, user *SessionUser, typ, outcome string) {
 	if p.audit == nil {
 		return
@@ -132,11 +137,13 @@ func (p *OIDCProvider) auditEvent(r *http.Request, user *SessionUser, typ, outco
 		UserAgent: r.UserAgent(),
 		Action:    r.Method + " " + r.URL.Path,
 	}
-	if user != nil {
-		e.Actor = user.Sub
-		e.ActorName = user.Email
-		e.Groups = user.Groups
+	if user == nil {
+		p.audit.EmitThrottled(e)
+		return
 	}
+	e.Actor = user.Sub
+	e.ActorName = user.Email
+	e.Groups = user.Groups
 	p.audit.EmitAccess(e)
 }
 

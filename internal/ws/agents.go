@@ -1,6 +1,7 @@
 package ws
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -262,29 +263,55 @@ func SendSignedCommand(store *state.Store, clientID string, event string, payloa
 // SendSignedCommandAs signs and sends a command attributed to actor. The actor
 // is folded into the signed payload, so rewriting it invalidates the signature.
 func SendSignedCommandAs(store *state.Store, clientID string, event string, payload any, actor string, log *logging.Logger) bool {
-	payload = withActor(payload, actor)
+	payload, attributed := withActor(payload, actor)
+	if !attributed {
+		log.Warn("command payload is not a JSON object; sending unattributed",
+			"clientId", clientID, "event", event)
+	}
 	return sendSignedCommand(store, clientID, event, payload, log)
 }
 
-// withActor returns payload with the acting principal attached. A payload that
-// is not a JSON object is wrapped so attribution is not dropped.
-func withActor(payload any, actor string) any {
+// withActor returns payload with the acting principal added as a top-level key,
+// and reports whether attribution succeeded.
+//
+// The actor must land alongside the payload's own fields, not nested beneath a
+// wrapper, because agents unmarshal the payload straight into typed structs:
+// a nested payload decodes without error into a zero-valued struct. Typed maps
+// (map[string]string) and structs therefore go through a JSON round trip rather
+// than being wrapped. UseNumber keeps int64 values exact across it.
+//
+// A payload that is not a JSON object has nowhere to put the key. Those are
+// returned unchanged rather than restructured: losing attribution is recoverable
+// from the server-side audit trail, whereas reshaping a payload silently breaks
+// the command.
+func withActor(payload any, actor string) (any, bool) {
 	if actor == "" {
 		actor = ActorSystem
 	}
-	switch p := payload.(type) {
-	case map[string]any:
-		out := make(map[string]any, len(p)+1)
-		for k, v := range p {
+	if payload == nil {
+		return map[string]any{actorPayloadKey: actor}, true
+	}
+	if m, ok := payload.(map[string]any); ok {
+		out := make(map[string]any, len(m)+1)
+		for k, v := range m {
 			out[k] = v
 		}
 		out[actorPayloadKey] = actor
-		return out
-	case nil:
-		return map[string]any{actorPayloadKey: actor}
-	default:
-		return map[string]any{actorPayloadKey: actor, "value": p}
+		return out, true
 	}
+
+	raw, err := json.Marshal(payload)
+	if err != nil || len(raw) == 0 || raw[0] != '{' {
+		return payload, false
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var m map[string]any
+	if err := dec.Decode(&m); err != nil {
+		return payload, false
+	}
+	m[actorPayloadKey] = actor
+	return m, true
 }
 
 func sendSignedCommand(store *state.Store, clientID string, event string, payload any, log *logging.Logger) bool {
@@ -337,7 +364,8 @@ func (h *AgentHandler) auditAgentAuthFailure(r *http.Request, clientID, reason s
 	if h.audit == nil {
 		return
 	}
-	h.audit.Emit(audit.Event{
+	// Reachable without a valid handshake, so throttled.
+	h.audit.EmitThrottled(audit.Event{
 		Type:      audit.TypeAgentAuthFail,
 		Outcome:   audit.OutcomeDeny,
 		Actor:     "agent:" + clientID,

@@ -57,6 +57,11 @@ type DashboardHandler struct {
 	// audit records dashboard session lifecycle. Nil disables recording.
 	audit *audit.Logger
 
+	// insecure serves dashboard sessions with no authentication, for running
+	// without an OIDC provider. Set only from config.InsecureAllowUnauthenticated,
+	// which startup refuses to default on.
+	insecure bool
+
 	// dashMu protects dashboards map
 	dashMu     sync.RWMutex
 	dashboards map[string]*DashboardConn
@@ -83,6 +88,16 @@ func NewDashboardHandler(store *state.Store, log *logging.Logger, oidc *auth.OID
 // SetAudit attaches the audit logger. Called during server wiring.
 func (h *DashboardHandler) SetAudit(a *audit.Logger) { h.audit = a }
 
+// InsecureUser is the principal assigned to dashboard sessions when running
+// without authentication. It is a local-development identity: it never comes
+// from an IdP, and audit records carrying it mean the session was not
+// authenticated at all.
+const InsecureUser = "insecure:unauthenticated"
+
+// SetInsecureAllowUnauthenticated serves dashboard sessions without
+// authentication. Wired only from config.InsecureAllowUnauthenticated.
+func (h *DashboardHandler) SetInsecureAllowUnauthenticated(v bool) { h.insecure = v }
+
 // ServeHTTP upgrades the HTTP connection to WebSocket for dashboards.
 func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Authenticate: session cookie or Bearer token
@@ -95,7 +110,9 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			"hasAuth", r.Header.Get("Authorization") != "",
 		)
 		if h.audit != nil {
-			h.audit.Emit(audit.Event{
+			// Reachable without credentials; throttled so it cannot be used to
+			// drive unbounded appends.
+			h.audit.EmitThrottled(audit.Event{
 				Type:      audit.TypeLoginFailure,
 				Outcome:   audit.OutcomeDeny,
 				Remote:    audit.RemoteIP(r),
@@ -126,7 +143,7 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Conn:    conn,
 		User:    user,
 		ID:      connID,
-		IsAdmin: h.oidc.IsAdmin(user),
+		IsAdmin: h.oidc == nil && h.insecure || h.oidc != nil && h.oidc.IsAdmin(user),
 	}
 
 	// Register dashboard connection
@@ -213,6 +230,9 @@ func (h *DashboardHandler) ConnectedCount() int {
 
 func (h *DashboardHandler) authenticate(r *http.Request) (*auth.SessionUser, error) {
 	if h.oidc == nil {
+		if h.insecure {
+			return &auth.SessionUser{Sub: InsecureUser, Name: "unauthenticated"}, nil
+		}
 		// No OIDC configured — reject all connections
 		return nil, nil
 	}

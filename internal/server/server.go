@@ -119,6 +119,7 @@ func New(ctx context.Context, cfg *config.Config, log *logging.Logger) (*Server,
 	// Dashboard handler
 	s.dashboard = ws.NewDashboardHandler(store, log, s.oidc, cfg.DashboardAllowedOrigins)
 	s.dashboard.SetAudit(auditLog)
+	s.dashboard.SetInsecureAllowUnauthenticated(s.oidc == nil && cfg.InsecureAllowUnauthenticated)
 	s.agents.SetAudit(auditLog)
 
 	// Relay (with backup plan persistence directory)
@@ -352,10 +353,16 @@ func (s *Server) Run(ctx context.Context) error {
 func (s *Server) buildHandler() http.Handler {
 	mux := chi.NewMux()
 
-	// API routes
+	// API routes. A nil middleware denies (see api.DenyAll); running without
+	// authentication requires the explicit opt-in, which config.Validate
+	// refuses to default on.
 	var authMW func(http.Handler) http.Handler
-	if s.oidc != nil {
+	switch {
+	case s.oidc != nil:
 		authMW = s.oidc.RequireAuth
+	case s.cfg.InsecureAllowUnauthenticated:
+		s.log.Error("insecureAllowUnauthenticated is set: the API, dashboard and SPA are served with NO authentication — every route, including server shutdown and exec-allowlist mutation, is open to anyone who can reach this port")
+		authMW = api.PassThrough
 	}
 	deps := api.Deps{
 		Store:     s.store,
@@ -367,6 +374,9 @@ func (s *Server) buildHandler() http.Handler {
 		Audit:     s.audit,
 		AuditPath: s.cfg.AuditLogFile,
 		StartTime: time.Now(),
+	}
+	if s.oidc == nil && s.cfg.InsecureAllowUnauthenticated {
+		deps.AdminMiddleware = api.PassThrough
 	}
 	if s.oidc != nil {
 		deps.AuthStatusHandler = s.oidc.HandleAuthStatus
@@ -412,9 +422,10 @@ func (s *Server) buildHandler() http.Handler {
 		s.log.Info("SPA enabled", "distDir", distDir)
 		spaHandler := spa.NewHandler(distDir)
 		return &spaFallback{
-			primary: mux,
-			spa:     spaHandler,
-			oidc:    s.oidc,
+			primary:  mux,
+			spa:      spaHandler,
+			oidc:     s.oidc,
+			insecure: s.cfg.InsecureAllowUnauthenticated,
 		}
 	}
 
@@ -425,9 +436,10 @@ func (s *Server) buildHandler() http.Handler {
 // spaFallback routes API/auth/WS requests to primary handler, everything else to SPA.
 // When oidc is set, unauthenticated requests are redirected to /auth/login.
 type spaFallback struct {
-	primary http.Handler
-	spa     http.Handler
-	oidc    *auth.OIDCProvider
+	primary  http.Handler
+	spa      http.Handler
+	oidc     *auth.OIDCProvider
+	insecure bool
 }
 
 func (f *spaFallback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -439,6 +451,10 @@ func (f *spaFallback) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Require OIDC auth for SPA routes. A nil provider means authentication was
 	// never configured, and there is no login to redirect to.
 	if f.oidc == nil {
+		if f.insecure {
+			f.spa.ServeHTTP(w, r)
+			return
+		}
 		http.Error(w, "unauthorized: no authentication provider configured", http.StatusUnauthorized)
 		return
 	}

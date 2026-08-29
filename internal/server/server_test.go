@@ -320,3 +320,64 @@ func findFreePort(t *testing.T) int {
 	ln.Close()
 	return port
 }
+
+// The validation error tells operators to set insecureAllowUnauthenticated, so
+// the flag has to actually produce a usable server. Without this, every route
+// denied, the SPA 401'd, and only /healthz answered — the advertised escape
+// hatch did nothing but let the process start.
+func TestInsecureAllowUnauthenticated_ServesWithoutOIDC(t *testing.T) {
+	cfg := minimalConfig(t)
+	cfg.InsecureAllowUnauthenticated = true
+	cfg.Port = findFreePort(t)
+
+	srv, err := New(context.Background(), cfg, testLogger(t))
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	srv.EnableCLI = false
+	srv.store.AddClient("agent-1", nil)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(200 * time.Millisecond)
+
+	for _, path := range []string{"/healthz", "/api/status", "/api/server/exec-allowlist"} {
+		resp, err := http.Get(fmt.Sprintf("http://localhost:%d%s", cfg.Port, path))
+		if err != nil {
+			t.Fatalf("GET %s failed: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("GET %s = %d, want 200 when insecureAllowUnauthenticated is set", path, resp.StatusCode)
+		}
+	}
+}
+
+// The opt-in must be the only thing that opens the server up: a config that
+// merely lacks OIDC still denies.
+func TestWithoutOptIn_StillDenies(t *testing.T) {
+	cfg := minimalConfig(t)
+	cfg.InsecureAllowUnauthenticated = false
+	cfg.Port = findFreePort(t)
+
+	srv, err := New(context.Background(), cfg, testLogger(t))
+	if err != nil {
+		t.Fatalf("New() error: %v", err)
+	}
+	srv.EnableCLI = false
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go srv.Run(ctx)
+	time.Sleep(200 * time.Millisecond)
+
+	resp, err := http.Get(fmt.Sprintf("http://localhost:%d/api/status", cfg.Port))
+	if err != nil {
+		t.Fatalf("GET failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode == http.StatusOK {
+		t.Error("/api/status served without OIDC and without the explicit opt-in")
+	}
+}

@@ -376,6 +376,23 @@ func TestSendSignedCommand(t *testing.T) {
 	if err := verifier.Verify(&envelope); err != nil {
 		t.Fatalf("agent-side verify failed: %v", err)
 	}
+
+	// Decode the payload the way the agent does. A valid signature over a
+	// payload whose fields moved is still a broken command: json.Unmarshal
+	// reports no error and leaves the struct zeroed.
+	var decoded struct {
+		Session string `json:"session"`
+		Actor   string `json:"_actor"`
+	}
+	if err := json.Unmarshal(envelope.Payload, &decoded); err != nil {
+		t.Fatalf("agent-side payload decode: %v", err)
+	}
+	if decoded.Session != "s1" {
+		t.Errorf("agent decoded session = %q, want s1 (payload: %s)", decoded.Session, envelope.Payload)
+	}
+	if decoded.Actor != ActorSystem {
+		t.Errorf("agent decoded _actor = %q, want %q", decoded.Actor, ActorSystem)
+	}
 }
 
 // The acting principal is folded into the signed payload rather than added as
@@ -385,7 +402,8 @@ func TestWithActor_KeepsPayloadSignable(t *testing.T) {
 	key := cmdsig.DeriveSessionKey("token", "nonce")
 	signer := cmdsig.NewSigner(key)
 
-	env, err := signer.Sign("exec_request", withActor(map[string]any{"command": "id"}, "alice"))
+	withActorPayload, _ := withActor(map[string]any{"command": "id"}, "alice")
+	env, err := signer.Sign("exec_request", withActorPayload)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -416,12 +434,19 @@ func TestWithActor_AlwaysAttributes(t *testing.T) {
 		{"map", map[string]any{"a": 1}, "alice", "alice"},
 		{"nil payload", nil, "alice", "alice"},
 		{"empty actor falls back to system", map[string]any{}, "", ActorSystem},
-		{"non-object payload is wrapped", "scalar", "alice", "alice"},
+		{"typed string map", map[string]string{"session": "s1"}, "alice", "alice"},
+		{"struct", struct {
+			Session string `json:"session"`
+		}{"s1"}, "alice", "alice"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, ok := withActor(tc.payload, tc.actor).(map[string]any)
+			v, attributed := withActor(tc.payload, tc.actor)
+			if !attributed {
+				t.Fatalf("withActor reported no attribution for %T", tc.payload)
+			}
+			got, ok := v.(map[string]any)
 			if !ok {
-				t.Fatalf("withActor did not return an object: %T", got)
+				t.Fatalf("withActor did not return an object: %T", v)
 			}
 			if got[actorPayloadKey] != tc.want {
 				t.Errorf("actor = %v, want %v", got[actorPayloadKey], tc.want)
@@ -434,8 +459,59 @@ func TestWithActor_AlwaysAttributes(t *testing.T) {
 // once, and mutation would leak the actor across sends.
 func TestWithActor_DoesNotMutateInput(t *testing.T) {
 	original := map[string]any{"command": "id"}
-	withActor(original, "alice")
+	withActor(original, "alice") //nolint:errcheck // mutation is what's under test
 	if _, leaked := original[actorPayloadKey]; leaked {
 		t.Error("withActor mutated the caller's payload")
+	}
+}
+
+// Relay handlers send session-scoped commands as map[string]string. Wrapping
+// those under a "value" key produces a payload the agent unmarshals without
+// error into a struct with every field zeroed, so shells never start and PTYs
+// are never closed on dashboard disconnect.
+func TestWithActor_PreservesTypedStringMaps(t *testing.T) {
+	v, attributed := withActor(map[string]string{"session": "sess-1"}, "alice")
+	if !attributed {
+		t.Fatal("withActor dropped attribution for map[string]string")
+	}
+	got, ok := v.(map[string]any)
+	if !ok {
+		t.Fatalf("withActor returned %T, want map[string]any", v)
+	}
+	if got["session"] != "sess-1" {
+		t.Errorf("session = %v, want sess-1 (payload must stay flat, not nested under a wrapper key)", got["session"])
+	}
+	if got[actorPayloadKey] != "alice" {
+		t.Errorf("_actor = %v, want alice", got[actorPayloadKey])
+	}
+	if _, wrapped := got["value"]; wrapped {
+		t.Error("payload was nested under a \"value\" key; the agent decodes fields at the top level")
+	}
+}
+
+// End to end: what the agent actually decodes has to match what the handler sent.
+func TestWithActor_AgentSeesOriginalFields(t *testing.T) {
+	for _, payload := range []any{
+		map[string]string{"session": "sess-1"},
+		map[string]any{"session": "sess-1"},
+	} {
+		attributed, _ := withActor(payload, "alice")
+		raw, err := json.Marshal(attributed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var decoded struct {
+			Session string `json:"session"`
+			Actor   string `json:"_actor"`
+		}
+		if err := json.Unmarshal(raw, &decoded); err != nil {
+			t.Fatalf("%T: %v", payload, err)
+		}
+		if decoded.Session != "sess-1" {
+			t.Errorf("%T: session decoded as %q, want sess-1 (raw: %s)", payload, decoded.Session, raw)
+		}
+		if decoded.Actor != "alice" {
+			t.Errorf("%T: _actor decoded as %q, want alice", payload, decoded.Actor)
+		}
 	}
 }

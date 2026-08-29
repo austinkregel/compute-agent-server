@@ -4,10 +4,12 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/austinkregel/backup-server/internal/allowlist"
+	"github.com/austinkregel/backup-server/internal/audit"
 	"github.com/austinkregel/backup-server/internal/config"
 	"github.com/austinkregel/backup-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/logging"
@@ -719,5 +721,70 @@ func TestDoubleSlash_Normalized(t *testing.T) {
 	w := doRequest(t, r, "GET", "//api//status", "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200 after slash normalization", w.Code)
+	}
+}
+
+// The type filter has to run before the limit. Filtering the already-truncated
+// window returns nothing whenever the matching records lie further back, which
+// is the common case for a rare event type like a denied admin action.
+func TestAuditGet_FiltersBeforeLimiting(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "audit.jsonl")
+	al, err := audit.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer al.Close()
+
+	// One rare record, then enough routine ones to push it past any window.
+	al.Emit(audit.Event{Type: audit.TypeAdminDenied, Actor: "mallory", Action: "shell_start"})
+	for i := 0; i < 300; i++ {
+		al.Emit(audit.Event{Type: audit.TypeDashboardOpen, Actor: "alice"})
+	}
+
+	deps := testDeps(t)
+	deps.Audit, deps.AuditPath = al, path
+	r := NewRouter(deps, PassThrough)
+
+	w := doRequest(t, r, "GET", "/api/audit?type=admin_denied&limit=50", "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	result := decodeJSON(t, w)
+	events, _ := result["events"].([]any)
+	if len(events) != 1 {
+		t.Fatalf("got %d matching records, want 1 — the filter must run before the limit", len(events))
+	}
+	got, _ := events[0].(map[string]any)
+	if got["actor"] != "mallory" {
+		t.Errorf("actor = %v, want mallory", got["actor"])
+	}
+}
+
+// The limit still bounds the response once the filter has been applied.
+func TestAuditGet_LimitAppliesAfterFilter(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "audit.jsonl")
+	al, err := audit.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer al.Close()
+	for i := 0; i < 40; i++ {
+		al.Emit(audit.Event{Type: audit.TypeAdminAction, Actor: "alice"})
+	}
+
+	deps := testDeps(t)
+	deps.Audit, deps.AuditPath = al, path
+	r := NewRouter(deps, PassThrough)
+
+	w := doRequest(t, r, "GET", "/api/audit?type=admin_action&limit=10", "")
+	result := decodeJSON(t, w)
+	events, _ := result["events"].([]any)
+	if len(events) != 10 {
+		t.Errorf("got %d records, want 10", len(events))
+	}
+	chain, _ := result["chain"].(map[string]any)
+	if chain["valid"] != true {
+		t.Errorf("chain = %v, want valid", chain)
 	}
 }

@@ -677,7 +677,7 @@ func (r *Relay) CleanupDashboard(dc *ws.DashboardConn) {
 			// Disconnect-driven cleanup, not a user instruction: attributed to
 			// the control plane rather than to the departed user.
 			ws.SendSignedCommand(r.store, sess.ClientID, "shell_close",
-				map[string]string{"session": sessionID}, r.log)
+				map[string]any{"session": sessionID}, r.log)
 			delete(r.shellSessions, sessionID)
 		}
 	}
@@ -688,7 +688,7 @@ func (r *Relay) CleanupDashboard(dc *ws.DashboardConn) {
 	for sessionID, sess := range r.logSessions {
 		if sess.DashConnID == connID {
 			ws.SendSignedCommand(r.store, sess.ClientID, "log_tail_stop",
-				map[string]string{"session": sessionID}, r.log)
+				map[string]any{"session": sessionID}, r.log)
 			delete(r.logSessions, sessionID)
 		}
 	}
@@ -741,7 +741,7 @@ func (r *Relay) handleShellStart(dc *ws.DashboardConn, data map[string]any) {
 	r.shellMu.Unlock()
 
 	r.sendAs(dc, clientID, "shell_start",
-		map[string]string{"session": sessionID})
+		map[string]any{"session": sessionID})
 
 	r.dash.SendTo(dc.ID, "shell_started", map[string]any{
 		"session":  sessionID,
@@ -789,7 +789,7 @@ func (r *Relay) handleShellClose(dc *ws.DashboardConn, data map[string]any) {
 	}
 
 	r.sendAs(dc, sess.ClientID, "shell_close",
-		map[string]string{"session": sessionID})
+		map[string]any{"session": sessionID})
 
 	r.dash.SendTo(dc.ID, "shell_closed", map[string]any{
 		"session": sessionID,
@@ -884,7 +884,7 @@ func (r *Relay) handleLogTailStop(dc *ws.DashboardConn, data map[string]any) {
 		// Stop specific session
 		if sess, ok := r.logSessions[sessionID]; ok && sess.DashConnID == dc.ID {
 			r.sendAs(dc, sess.ClientID, "log_tail_stop",
-				map[string]string{"session": sessionID})
+				map[string]any{"session": sessionID})
 			delete(r.logSessions, sessionID)
 		}
 	} else if clientID != "" {
@@ -892,7 +892,7 @@ func (r *Relay) handleLogTailStop(dc *ws.DashboardConn, data map[string]any) {
 		for sid, sess := range r.logSessions {
 			if sess.ClientID == clientID && sess.DashConnID == dc.ID {
 				r.sendAs(dc, clientID, "log_tail_stop",
-					map[string]string{"session": sid})
+					map[string]any{"session": sid})
 				delete(r.logSessions, sid)
 			}
 		}
