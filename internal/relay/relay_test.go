@@ -725,6 +725,45 @@ func TestFileGetChunkAndResult_RoutedToOwner(t *testing.T) {
 	}
 }
 
+func TestFileGetRange_FieldsRelayedVerbatim(t *testing.T) {
+	r, md, store := testRelay(t)
+	store.AddClient("node-1", nil)
+	dc := newMockDC("dash-1")
+
+	r.HandleDashboardEvent(dc, makeMsg("file_get_request", map[string]any{
+		"clientId": "node-1", "path": "/tmp/big.log", "offset": float64(100), "length": float64(50),
+	}))
+	if md.findSent("dash-1", "file_get_dispatched") == nil {
+		t.Fatal("file_get_dispatched not sent to dash-1")
+	}
+
+	r.fileMu.RLock()
+	var reqID string
+	for id := range r.fileOps {
+		reqID = id
+	}
+	r.fileMu.RUnlock()
+
+	r.HandleAgentEvent("node-1", makeMsg("file_get_result", map[string]any{
+		"requestId": reqID, "ok": true, "path": "/tmp/big.log",
+		"size": float64(1000), "offset": float64(100), "returned": float64(50),
+		"eof": false, "truncated": true, "errorCode": "",
+	}))
+
+	result := md.findSent("dash-1", "file_get_result")
+	if result == nil {
+		t.Fatal("file_get_result not routed to dash-1")
+	}
+	for k, want := range map[string]any{
+		"size": float64(1000), "offset": float64(100), "returned": float64(50),
+		"eof": false, "truncated": true,
+	} {
+		if result.Data[k] != want {
+			t.Errorf("result[%q] = %v, want %v", k, result.Data[k], want)
+		}
+	}
+}
+
 func TestFileGetChunk_UnknownRequestIgnored(t *testing.T) {
 	r, md, store := testRelay(t)
 	store.AddClient("node-1", nil)
