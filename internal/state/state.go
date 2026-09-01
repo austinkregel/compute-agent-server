@@ -12,6 +12,16 @@ import (
 // StatsHistoryLimit is the max number of stats samples retained per client.
 const StatsHistoryLimit = 25
 
+// OfflineRetention is how long a disconnected agent stays on the roster as an
+// offline entry before being forgotten.
+const OfflineRetention = 24 * time.Hour
+
+// MaxOfflineClients caps the retained offline roster. Client IDs arrive from
+// the network, so an agent that reconnects under a fresh ID on every attempt
+// must not be able to grow this map without bound; the oldest drop is evicted
+// once the cap is reached.
+const MaxOfflineClients = 256
+
 // ClientEntry represents a connected agent in the server's state.
 type ClientEntry struct {
 	Mu sync.Mutex
@@ -68,6 +78,13 @@ type CapabilityInfo struct {
 type PublicClient struct {
 	ClientID      string `json:"clientId"`
 	LastPong      int64  `json:"lastPong"`
+	// Connected reports whether the agent's socket is open right now. False
+	// entries are retained last-known snapshots (see Store.lastSeen) so the
+	// dashboard can render a node as offline instead of having it vanish.
+	Connected bool `json:"connected"`
+	// DisconnectedAt is Unix milliseconds of the drop, set only when
+	// Connected is false.
+	DisconnectedAt int64 `json:"disconnectedAt,omitempty"`
 	// PingRttMs is the last measured ping→pong round-trip (ms). Omitted until known.
 	PingRttMs     int64  `json:"pingRttMs,omitempty"`
 	Authenticated bool   `json:"authenticated"`
@@ -134,7 +151,13 @@ type StatsEntry struct {
 type Store struct {
 	mu sync.RWMutex
 
-	clients       map[string]*ClientEntry
+	clients map[string]*ClientEntry
+	// lastSeen retains a snapshot of agents that have disconnected, so the
+	// dashboard keeps showing them as offline rather than dropping them from
+	// the roster. Deliberately separate from clients: HasClient/ClientIDs/
+	// AllClients are the reachability gates used throughout relay and api, and
+	// they must keep meaning "connected right now".
+	lastSeen      map[string]PublicClient
 	statsCache    map[string]map[string]any
 	statsHistory  map[string][]StatsEntry
 	alertsCache   map[string]map[string]any
@@ -158,6 +181,7 @@ type Store struct {
 func New() *Store {
 	return &Store{
 		clients:         make(map[string]*ClientEntry),
+		lastSeen:        make(map[string]PublicClient),
 		statsCache:      make(map[string]map[string]any),
 		statsHistory:    make(map[string][]StatsEntry),
 		alertsCache:     make(map[string]map[string]any),
@@ -176,6 +200,9 @@ func New() *Store {
 func (s *Store) AddClient(clientID string, conn *websocket.Conn) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	// It is back; drop the offline snapshot so the roster does not list the
+	// same agent twice.
+	delete(s.lastSeen, clientID)
 	s.clients[clientID] = &ClientEntry{
 		ClientID:      clientID,
 		Conn:          conn,
@@ -184,11 +211,59 @@ func (s *Store) AddClient(clientID string, conn *websocket.Conn) {
 	}
 }
 
-// RemoveClient removes an agent and cleans up associated state.
+// RemoveClient marks an agent disconnected. The live entry is dropped so every
+// reachability check (HasClient, ClientIDs, AllClients) immediately reports it
+// as gone, but a last-known snapshot is retained in lastSeen so PublicClients
+// can still render it as offline. Cached stats/alerts are left in place, so an
+// offline node keeps showing the values it last reported.
 func (s *Store) RemoveClient(clientID string) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if e, ok := s.clients[clientID]; ok {
+		e.Mu.Lock()
+		pub := publicClientLocked(e)
+		e.Mu.Unlock()
+		pub.Connected = false
+		pub.DisconnectedAt = time.Now().UnixMilli()
+		s.lastSeen[clientID] = pub
+	}
 	delete(s.clients, clientID)
-	s.mu.Unlock()
+
+	s.pruneOfflineLocked()
+}
+
+// pruneOfflineLocked drops expired offline entries, then evicts the oldest
+// remaining ones until the roster fits MaxOfflineClients. Caller holds s.mu.
+func (s *Store) pruneOfflineLocked() {
+	cutoff := time.Now().Add(-OfflineRetention).UnixMilli()
+	for id, pub := range s.lastSeen {
+		if pub.DisconnectedAt < cutoff {
+			s.forgetLocked(id)
+		}
+	}
+	for len(s.lastSeen) > MaxOfflineClients {
+		oldestID, oldestAt := "", int64(0)
+		for id, pub := range s.lastSeen {
+			if oldestID == "" || pub.DisconnectedAt < oldestAt {
+				oldestID, oldestAt = id, pub.DisconnectedAt
+			}
+		}
+		s.forgetLocked(oldestID)
+	}
+}
+
+// forgetLocked drops an agent from the offline roster along with the caches
+// keyed by its ID. Those caches are only ever written, never cleaned, so
+// bounding the roster alone would still leak a stats ring buffer, an alert
+// snapshot and two status maps per client ID ever seen. Caller holds s.mu.
+func (s *Store) forgetLocked(clientID string) {
+	delete(s.lastSeen, clientID)
+	delete(s.statsCache, clientID)
+	delete(s.statsHistory, clientID)
+	delete(s.alertsCache, clientID)
+	delete(s.kioskStatus, clientID)
+	delete(s.variantStatus, clientID)
 }
 
 // HasClient returns true if the client is connected.
@@ -224,31 +299,58 @@ func (s *Store) ClientCount() int {
 	return len(s.clients)
 }
 
-// PublicClients returns a safe projection of all connected clients.
+// publicClientLocked projects an entry into its JSON-safe form. Caller holds
+// e.Mu. Connected is left false; the caller sets it, since this same
+// projection is used both for live entries and for the offline snapshot taken
+// at disconnect.
+func publicClientLocked(e *ClientEntry) PublicClient {
+	return PublicClient{
+		ClientID:          e.ClientID,
+		LastPong:          e.LastPong.UnixMilli(),
+		PingRttMs:         e.RttMs,
+		Authenticated:     e.Authenticated,
+		Platform:          e.Platform,
+		Release:           e.Release,
+		Hostname:          e.Hostname,
+		Arch:              e.Arch,
+		Home:              e.Home,
+		CPUs:              e.CPUs,
+		AgentVersion:      e.AgentVersion,
+		DirectAddr:        e.DirectAddr,
+		DirectCertSHA256:  e.DirectCertSHA256,
+		DirectPinRequired: e.DirectPinRequired,
+		Capabilities:      e.Capabilities,
+	}
+}
+
+// PublicClients returns a safe projection of the roster: every connected agent
+// (Connected true), plus agents that have dropped within OfflineRetention
+// (Connected false, carrying the metadata they last reported). Offline entries
+// are included so a node greys out on the dashboard rather than disappearing.
 func (s *Store) PublicClients() []PublicClient {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	out := make([]PublicClient, 0, len(s.clients))
+	out := make([]PublicClient, 0, len(s.clients)+len(s.lastSeen))
 	for _, e := range s.clients {
 		e.Mu.Lock()
-		pub := PublicClient{
-			ClientID:          e.ClientID,
-			LastPong:          e.LastPong.UnixMilli(),
-			PingRttMs:         e.RttMs,
-			Authenticated:     e.Authenticated,
-			Platform:          e.Platform,
-			Release:           e.Release,
-			Hostname:          e.Hostname,
-			Arch:              e.Arch,
-			Home:              e.Home,
-			CPUs:              e.CPUs,
-			AgentVersion:      e.AgentVersion,
-			DirectAddr:        e.DirectAddr,
-			DirectCertSHA256:  e.DirectCertSHA256,
-			DirectPinRequired: e.DirectPinRequired,
-			Capabilities:      e.Capabilities,
-		}
+		pub := publicClientLocked(e)
 		e.Mu.Unlock()
+		pub.Connected = true
+		out = append(out, pub)
+	}
+	// Filtered on read as well as pruned on write: pruning only runs when some
+	// agent disconnects, so without this an expired entry would linger on a
+	// quiet server indefinitely.
+	cutoff := time.Now().Add(-OfflineRetention).UnixMilli()
+	for _, pub := range s.lastSeen {
+		// Defensive: a reconnect deletes the snapshot under the same lock, so
+		// an ID should never be in both maps.
+		if _, live := s.clients[pub.ClientID]; live {
+			continue
+		}
+		if pub.DisconnectedAt < cutoff {
+			continue
+		}
 		out = append(out, pub)
 	}
 	return out
@@ -402,11 +504,19 @@ func (s *Store) GetStats(clientID string) map[string]any {
 	return s.statsCache[clientID]
 }
 
-// GetStatsHistory returns the stats history for a client.
+// GetStatsHistory returns a copy of the retained samples. Copied rather than
+// aliased because UpdateStats appends in place, so a caller ranging over the
+// live slice outside s.mu would race with the next sample.
 func (s *Store) GetStatsHistory(clientID string) []StatsEntry {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	return s.statsHistory[clientID]
+	src := s.statsHistory[clientID]
+	if len(src) == 0 {
+		return nil
+	}
+	out := make([]StatsEntry, len(src))
+	copy(out, src)
+	return out
 }
 
 // --- Alerts ---

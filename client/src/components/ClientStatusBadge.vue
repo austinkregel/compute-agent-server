@@ -27,9 +27,22 @@ const lastTimestampMs = computed(() => {
   }
   return 0;
 });
-const online = computed(() => lastTimestampMs.value && (now.value - lastTimestampMs.value < ONLINE_THRESHOLD_MS));
+// The server's `connected` flag is authoritative when present: it reflects the
+// agent's socket, so a node that just dropped reads as offline immediately
+// instead of waiting out the staleness window. The timestamp heuristic remains
+// the fallback for callers that pass no flag, and still catches an agent whose
+// socket is up but which has stopped reporting.
+const online = computed(() => {
+  if (props.client?.connected === false) return false;
+  return !!(lastTimestampMs.value && (now.value - lastTimestampMs.value < ONLINE_THRESHOLD_MS));
+});
 const lastSeenSeconds = computed(() => lastTimestampMs.value ? Math.floor((now.value - lastTimestampMs.value)/1000) : null);
 const tooltip = computed(() => {
+  if (props.client?.connected === false) {
+    return lastTimestampMs.value
+      ? `Disconnected — last seen ${lastSeenSeconds.value}s ago`
+      : 'Disconnected';
+  }
   if (!lastTimestampMs.value) return 'No data received yet';
   return `Last seen ${lastSeenSeconds.value}s ago`;
 });

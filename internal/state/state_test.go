@@ -1,6 +1,7 @@
 package state
 
 import (
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -406,5 +407,139 @@ func TestStore_LogTailSessions(t *testing.T) {
 	s.RemoveLogTailSession("lt-1")
 	if s.GetLogTailSession("lt-1") != nil {
 		t.Error("GetLogTailSession() should be nil after Remove")
+	}
+}
+
+// A dropped agent must stay on the roster as an offline entry rather than
+// vanishing, while every reachability check keeps reporting it as gone.
+func TestStore_DisconnectedClientStaysOnRosterAsOffline(t *testing.T) {
+	s := New()
+	s.AddClient("node-1", nil)
+	entry := s.GetClient("node-1")
+	entry.Mu.Lock()
+	entry.Hostname = "box"
+	entry.Platform = "linux"
+	entry.Mu.Unlock()
+
+	s.RemoveClient("node-1")
+
+	// Reachability is unchanged: relay and api gate command routing on these.
+	if s.HasClient("node-1") {
+		t.Error("HasClient should be false once the socket is gone")
+	}
+	if s.ClientCount() != 0 {
+		t.Errorf("ClientCount = %d, want 0", s.ClientCount())
+	}
+	if len(s.ClientIDs()) != 0 {
+		t.Errorf("ClientIDs = %v, want empty", s.ClientIDs())
+	}
+	if len(s.AllClients()) != 0 {
+		t.Errorf("AllClients len = %d, want 0", len(s.AllClients()))
+	}
+
+	// But the dashboard roster still carries it, flagged offline and keeping
+	// the metadata it last reported.
+	clients := s.PublicClients()
+	if len(clients) != 1 {
+		t.Fatalf("PublicClients len = %d, want 1 offline entry", len(clients))
+	}
+	if clients[0].Connected {
+		t.Error("retained entry should be Connected=false")
+	}
+	if clients[0].Hostname != "box" || clients[0].Platform != "linux" {
+		t.Errorf("last-known metadata lost: %+v", clients[0])
+	}
+	if clients[0].DisconnectedAt == 0 {
+		t.Error("DisconnectedAt should be set")
+	}
+}
+
+func TestStore_ReconnectClearsOfflineEntry(t *testing.T) {
+	s := New()
+	s.AddClient("node-1", nil)
+	s.RemoveClient("node-1")
+	s.AddClient("node-1", nil)
+
+	clients := s.PublicClients()
+	if len(clients) != 1 {
+		t.Fatalf("PublicClients len = %d, want 1 (not a duplicate)", len(clients))
+	}
+	if !clients[0].Connected {
+		t.Error("reconnected client should be Connected=true")
+	}
+}
+
+// Client IDs come off the network, so an agent reconnecting under a fresh ID
+// each time must not grow the offline roster without bound.
+func TestStore_OfflineRosterIsBounded(t *testing.T) {
+	s := New()
+	for i := 0; i < MaxOfflineClients+50; i++ {
+		id := fmt.Sprintf("node-%d", i)
+		s.AddClient(id, nil)
+		s.RemoveClient(id)
+	}
+	if got := len(s.PublicClients()); got > MaxOfflineClients {
+		t.Errorf("offline roster = %d, want <= %d", got, MaxOfflineClients)
+	}
+}
+
+func TestStore_OfflineEntriesExpire(t *testing.T) {
+	s := New()
+	s.AddClient("stale", nil)
+	s.RemoveClient("stale")
+
+	// Backdate the drop past the retention window.
+	s.mu.Lock()
+	pub := s.lastSeen["stale"]
+	pub.DisconnectedAt = time.Now().Add(-OfflineRetention - time.Minute).UnixMilli()
+	s.lastSeen["stale"] = pub
+	s.mu.Unlock()
+
+	if got := s.PublicClients(); len(got) != 0 {
+		t.Errorf("PublicClients = %+v, want expired entry dropped", got)
+	}
+}
+
+// Bounding the roster is not enough on its own: the per-client caches are
+// write-only, so forgetting an agent must drop those too or they grow without
+// bound for every client ID the server has ever seen.
+func TestStore_ForgettingClientEvictsCaches(t *testing.T) {
+	s := New()
+	s.AddClient("gone", nil)
+	s.UpdateStats("gone", map[string]any{"cpu": 1.0})
+	s.SetAlerts("gone", map[string]any{"totalCount": float64(1)})
+	s.SetKioskStatus("gone", map[string]any{"running": true})
+	s.SetVariantStatus("gone", map[string]any{"current": "kiosk"})
+	s.RemoveClient("gone")
+
+	// Still offline-but-remembered: caches are intentionally kept so the node
+	// renders its last-known values.
+	if s.GetStats("gone") == nil {
+		t.Fatal("stats should survive while the offline entry is retained")
+	}
+
+	// Age it out, then force a prune via another disconnect.
+	s.mu.Lock()
+	pub := s.lastSeen["gone"]
+	pub.DisconnectedAt = time.Now().Add(-OfflineRetention - time.Minute).UnixMilli()
+	s.lastSeen["gone"] = pub
+	s.mu.Unlock()
+	s.AddClient("other", nil)
+	s.RemoveClient("other")
+
+	if s.GetStats("gone") != nil {
+		t.Error("statsCache not evicted for a forgotten client")
+	}
+	if len(s.GetStatsHistory("gone")) != 0 {
+		t.Error("statsHistory not evicted for a forgotten client")
+	}
+	if s.GetAlerts("gone") != nil {
+		t.Error("alertsCache not evicted for a forgotten client")
+	}
+	if s.GetKioskStatus("gone") != nil {
+		t.Error("kioskStatus not evicted for a forgotten client")
+	}
+	if s.GetVariantStatus("gone") != nil {
+		t.Error("variantStatus not evicted for a forgotten client")
 	}
 }

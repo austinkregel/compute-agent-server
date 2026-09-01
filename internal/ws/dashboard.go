@@ -39,12 +39,28 @@ func (dc *DashboardConn) Send(event string, data any) error {
 	if err != nil {
 		return err
 	}
+	return dc.writeFrame(msg)
+}
+
+// writeFrame writes an already-encoded frame under WriteTimeout. Broadcast
+// encodes once for every connection, so it shares this rather than re-encoding
+// per connection via Send.
+//
+// The deadline starts after the write lock is acquired, not before: charging a
+// connection's timeout for time spent queued behind another sender would close
+// healthy connections under load, which is the opposite of the intent. Once a
+// peer does time out the transport closes it, so senders queued behind it fail
+// immediately rather than each waiting out their own WriteTimeout.
+func (dc *DashboardConn) writeFrame(msg []byte) error {
 	if dc.Conn == nil {
 		return errors.New("dashboard connection has no socket")
 	}
 	dc.mu.Lock()
 	defer dc.mu.Unlock()
-	return dc.Conn.Write(context.Background(), websocket.MessageText, msg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), WriteTimeout)
+	defer cancel()
+	return dc.Conn.Write(ctx, websocket.MessageText, msg)
 }
 
 // DashboardHandler handles WebSocket connections from dashboards.
@@ -166,8 +182,13 @@ func (h *DashboardHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	// Send initial client list
+	// Send initial client list, then replay what the store already knows about
+	// each client. Agents only push stats every 30s and push kiosk/variant
+	// status on change, so without this a freshly loaded dashboard renders an
+	// empty node for up to half a minute (or indefinitely, for the on-change
+	// signals) even though the server has the values cached.
 	h.sendClientList(dc)
+	h.sendCachedState(dc)
 
 	// Start read loop
 	h.readLoop(r.Context(), dc)
@@ -199,10 +220,7 @@ func (h *DashboardHandler) Broadcast(event string, data any) {
 	h.dashMu.RUnlock()
 
 	for _, dc := range conns {
-		dc.mu.Lock()
-		err := dc.Conn.Write(context.Background(), websocket.MessageText, msg)
-		dc.mu.Unlock()
-		if err != nil {
+		if err := dc.writeFrame(msg); err != nil {
 			h.log.Debug("broadcast write failed", "connId", dc.ID, "event", event, "error", err)
 		}
 	}
@@ -293,6 +311,42 @@ func (h *DashboardHandler) sendClientList(dc *DashboardConn) {
 		"clientIds": clients,
 		"timestamp": time.Now().UTC().Format(isoMillis),
 	})
+}
+
+// sendCachedState replays the store's per-client caches to one dashboard,
+// using the exact event shapes the live broadcast path emits so the client
+// needs no special-casing for a replay. Timestamps are not synthesized: a
+// replayed sample keeps whatever the agent reported, so an offline node cannot
+// look freshly-reporting.
+func (h *DashboardHandler) sendCachedState(dc *DashboardConn) {
+	for _, pub := range h.store.PublicClients() {
+		id := pub.ClientID
+
+		if stats := h.store.GetStats(id); stats != nil {
+			_ = dc.Send("stats", map[string]any{"clientId": id, "data": stats})
+		}
+		if hist := h.store.GetStatsHistory(id); len(hist) > 0 {
+			samples := make([]map[string]any, 0, len(hist))
+			for _, entry := range hist {
+				samples = append(samples, entry.Stats)
+			}
+			_ = dc.Send("stats_history", map[string]any{"clientId": id, "samples": samples})
+		}
+		if alerts := h.store.GetAlerts(id); alerts != nil {
+			_ = dc.Send("alerts", map[string]any{"clientId": id, "data": alerts})
+		}
+		if kiosk := h.store.GetKioskStatus(id); kiosk != nil {
+			_ = dc.Send("kiosk_status", map[string]any{"clientId": id, "kiosk": kiosk})
+		}
+		if variant := h.store.GetVariantStatus(id); variant != nil {
+			payload := make(map[string]any, len(variant)+1)
+			for k, v := range variant {
+				payload[k] = v
+			}
+			payload["clientId"] = id
+			_ = dc.Send("variant_status", payload)
+		}
+	}
 }
 
 // BroadcastClientList sends the current client list to all dashboards.

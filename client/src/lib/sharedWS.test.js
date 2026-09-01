@@ -3,11 +3,35 @@ import {
   connected, clientIds, statsMap, on, send, __testInjectMessage,
   capabilitiesMap, clientHasCapability, clientCapabilityFeatures,
   smsThreadsMap, smsMessagesMap, fetchSmsThreads, fetchSmsMessages, sendSms,
+  statsHistory,
 } from './sharedWS.js';
 
 // We will mock WebSocket to control behavior
 
 // We don't rely on a real WebSocket here; we inject messages directly via helper.
+
+describe('sharedWS connect-time replay', () => {
+  it('replaces statsHistory from a stats_history replay rather than appending', () => {
+    // Simulate a localStorage-restored series from a previous page load.
+    statsHistory['replay-1'] = [{ cpu: 1 }, { cpu: 2 }];
+
+    __testInjectMessage({
+      type: 'stats_history',
+      clientId: 'replay-1',
+      samples: [{ cpu: 40 }, { cpu: 50 }],
+    });
+
+    // Replaced wholesale: a stale local series must not sit alongside the
+    // server's authoritative one.
+    expect(statsHistory['replay-1']).toEqual([{ cpu: 40 }, { cpu: 50 }]);
+  });
+
+  it('ignores a stats_history message with no samples array', () => {
+    statsHistory['replay-2'] = [{ cpu: 7 }];
+    __testInjectMessage({ type: 'stats_history', clientId: 'replay-2' });
+    expect(statsHistory['replay-2']).toEqual([{ cpu: 7 }]);
+  });
+});
 
 describe('sharedWS basic reactive state', () => {
   it('updates clientIds on client_list', async () => {

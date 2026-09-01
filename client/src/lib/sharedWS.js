@@ -167,6 +167,16 @@ function handleMessage(obj) {
         persistHistorySoon();
       }
       break;
+    case 'stats_history':
+      // Authoritative history replayed by the server when this dashboard
+      // connects. Replaces the localStorage-restored ring buffer rather than
+      // appending to it, so sparklines can't show a stale local series next to
+      // fresh server values.
+      if (obj.clientId && Array.isArray(obj.samples)) {
+        statsHistory[obj.clientId] = obj.samples.slice(-HISTORY_LIMIT);
+        persistHistorySoon();
+      }
+      break;
     case 'ping':
       // Server keepalive, reply with pong
       send({ type: 'pong', ts: Date.now() });

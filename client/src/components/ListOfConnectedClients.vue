@@ -52,6 +52,9 @@ const clients = computed(() => {
       name: stats.name ?? id,
       version: stats.agentVersion || stats?.agent?.version || otherdata.agentVersion || '-',
       ts: stats.ts,
+      // Undefined for callers/servers that don't report it; only an explicit
+      // false means "socket is down".
+      connected: otherdata.connected,
       updates: stats.updates || null,
       restartRequired: !!stats?.updates?.restartRequired,
       cpuSeries: tail(history).map(s => s.load?.['1m'] ?? 0),
@@ -65,7 +68,7 @@ const clients = computed(() => {
 
 <template>
   <div class="max-w-7xl mx-auto mt-8 px-4 sm:px-6 lg:px-8">
-    <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-4">Connected Clients</h2>
+    <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100 mb-4">Clients</h2>
     <div class="rounded-lg bg-white dark:bg-gray-800 overflow-hidden">
     <div class="overflow-x-auto">
       <table class="min-w-full divide-y divide-gray-200 dark:divide-gray-700">

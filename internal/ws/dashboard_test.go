@@ -536,3 +536,130 @@ func TestDashboardHandler_UserInEventCallback(t *testing.T) {
 		t.Errorf("user.Sub = %q, want user-xyz", gotUser.Sub)
 	}
 }
+
+// A dashboard that reloads must not have to wait out the agent's 30s stats
+// ticker (or, for on-change signals like kiosk/variant status, wait
+// indefinitely) before showing anything. The server caches all of it, so it
+// replays the caches right after client_list.
+func TestDashboardHandler_ReplaysCachedStateOnConnect(t *testing.T) {
+	mock := newDashMockOIDC(t)
+	server, store, _ := setupDashboardServer(t, mock)
+
+	store.AddClient("node-1", nil)
+	store.UpdateStats("node-1", map[string]any{"hostname": "box", "cpu": 12.5})
+	store.UpdateStats("node-1", map[string]any{"hostname": "box", "cpu": 33.0})
+	store.SetAlerts("node-1", map[string]any{"totalCount": float64(2), "hasCritical": true})
+	store.SetKioskStatus("node-1", map[string]any{"running": true, "connected": true})
+	store.SetVariantStatus("node-1", map[string]any{"current": "kiosk", "desired": "kiosk"})
+
+	token := mock.issueAccessToken("user-1", "user@example.com", "Test User")
+	conn := dialDashboard(t, server.URL, token)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// Collect the connect burst, keyed by event.
+	got := map[string]map[string]any{}
+	for i := 0; i < 6; i++ {
+		_, raw, err := conn.Read(ctx)
+		if err != nil {
+			break
+		}
+		msg, err := Decode(raw)
+		if err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		var data map[string]any
+		json.Unmarshal(msg.Data, &data)
+		got[msg.Event] = data
+	}
+
+	for _, event := range []string{"client_list", "stats", "stats_history", "alerts", "kiosk_status", "variant_status"} {
+		if got[event] == nil {
+			t.Errorf("no %q replayed on connect", event)
+		}
+	}
+
+	// Shapes must match the live broadcast path, or the dashboard would need
+	// to special-case replayed messages.
+	if stats, _ := got["stats"]["data"].(map[string]any); stats["cpu"] != 33.0 {
+		t.Errorf("stats.data.cpu = %v, want the newest sample 33", stats["cpu"])
+	}
+	if got["stats"]["clientId"] != "node-1" {
+		t.Errorf("stats.clientId = %v", got["stats"]["clientId"])
+	}
+	samples, _ := got["stats_history"]["samples"].([]any)
+	if len(samples) != 2 {
+		t.Errorf("stats_history samples = %d, want 2", len(samples))
+	}
+	if kiosk, _ := got["kiosk_status"]["kiosk"].(map[string]any); kiosk["running"] != true {
+		t.Errorf("kiosk_status.kiosk.running = %v", kiosk["running"])
+	}
+	if got["variant_status"]["current"] != "kiosk" {
+		t.Errorf("variant_status.current = %v", got["variant_status"]["current"])
+	}
+	if got["variant_status"]["clientId"] != "node-1" {
+		t.Errorf("variant_status.clientId = %v", got["variant_status"]["clientId"])
+	}
+}
+
+// Every write is bounded, so a dashboard that has stopped draining its socket
+// cannot pin the writing goroutine. That goroutine is frequently not its own —
+// stats broadcasts run on the agent read loop — so an unbounded write would let
+// one wedged browser tab stall an agent's whole event pipeline.
+func TestDashboardConn_WriteIsBounded(t *testing.T) {
+	if WriteTimeout <= 0 {
+		t.Fatalf("WriteTimeout = %v, want a positive bound", WriteTimeout)
+	}
+	// Shrunk so the test doesn't spend the production bound sitting on a
+	// blocked write; the behaviour under test is identical.
+	original := WriteTimeout
+	WriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { WriteTimeout = original })
+
+	// A conn whose peer never reads: fill it until a write blocks, and prove
+	// the block resolves on its own rather than hanging forever.
+	mock := newDashMockOIDC(t)
+	server, _, handler := setupDashboardServer(t, mock)
+
+	token := mock.issueAccessToken("user-1", "user@example.com", "Test User")
+	conn := dialDashboard(t, server.URL, token)
+	// Deliberately never read from conn.
+
+	var dc *DashboardConn
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		handler.dashMu.RLock()
+		for _, c := range handler.dashboards {
+			dc = c
+		}
+		handler.dashMu.RUnlock()
+		if dc != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if dc == nil {
+		t.Fatal("dashboard connection never registered")
+	}
+
+	// 1 MiB frames against a peer that never reads will exhaust the buffers.
+	payload := map[string]any{"blob": strings.Repeat("x", 1<<20)}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for i := 0; i < 64; i++ {
+			if err := dc.Send("stats", payload); err != nil {
+				return // timed out and the transport closed it: the point of the bound
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+		// Either every write drained or one failed; both terminate.
+	case <-time.After(30 * time.Second):
+		t.Fatal("writes to a non-draining dashboard did not terminate: the write deadline is not being applied")
+	}
+	_ = conn
+}

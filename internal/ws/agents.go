@@ -136,7 +136,11 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	helloAck, _ := Encode("hello_ack", map[string]string{
 		"sessionNonce": nonce,
 	})
-	if err := conn.Write(r.Context(), websocket.MessageText, helloAck); err != nil {
+	// Bounded like every other write, but derived from the request context so
+	// it still aborts if the handler is torn down first.
+	ackCtx, ackCancel := context.WithTimeout(r.Context(), WriteTimeout)
+	defer ackCancel()
+	if err := conn.Write(ackCtx, websocket.MessageText, helloAck); err != nil {
 		h.log.Error("failed to send hello_ack", "clientId", clientID, "error", err)
 		conn.Close(websocket.StatusInternalError, "hello_ack failed")
 		h.store.RemoveClient(clientID)
@@ -204,7 +208,7 @@ func (h *AgentHandler) readLoop(ctx context.Context, clientID string, conn *webs
 				"ts": time.Now().UnixMilli(),
 			})
 			if err == nil {
-				writeCtx, writeCancel := context.WithTimeout(context.Background(), 5*time.Second)
+				writeCtx, writeCancel := context.WithTimeout(context.Background(), WriteTimeout)
 				conn.Write(writeCtx, websocket.MessageText, pongMsg)
 				writeCancel()
 			}
@@ -350,7 +354,9 @@ func sendSignedCommand(store *state.Store, clientID string, event string, payloa
 		return false
 	}
 
-	if err := conn.Write(context.Background(), websocket.MessageText, msg); err != nil {
+	writeCtx, writeCancel := context.WithTimeout(context.Background(), WriteTimeout)
+	defer writeCancel()
+	if err := conn.Write(writeCtx, websocket.MessageText, msg); err != nil {
 		log.Warn("send command failed", "clientId", clientID, "event", event, "error", err)
 		return false
 	}
