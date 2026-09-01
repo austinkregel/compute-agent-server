@@ -29,8 +29,22 @@ jobs:
           go-version-file: go.mod
           cache-dependency-path: go.sum
 
-      - name: Run server tests
-        run: make test
+      # The dashboard is built into the published image, so its suite gates the
+      # release alongside the Go one. Node version tracks the Dockerfile's
+      # client-build stage.
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: client/package-lock.json
+
+      - name: Install dashboard dependencies
+        run: npm ci
+        working-directory: client
+
+      - name: Run server and dashboard tests
+        run: make test-all
 
   build-and-push:
     needs: test

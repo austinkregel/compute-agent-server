@@ -29,6 +29,18 @@ test-race:
 test-v:
 	go test -race -v ./...
 
+# Dashboard (vitest) suite. Deliberately not folded into `test`: that target is
+# the Go suite, and a Go-only change shouldn't require a Node toolchain to run
+# it. Assumes dependencies are already installed (npm ci / npm install).
+.PHONY: test-client
+test-client:
+	cd client && npm test
+
+# Both planes this module ships — the Go control plane and the dashboard baked
+# into its image. This is what CI runs before publishing.
+.PHONY: test-all
+test-all: test test-client
+
 .PHONY: coverage
 coverage:
 	go test ./... -coverpkg=./... -coverprofile=coverage.out
