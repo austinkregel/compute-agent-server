@@ -10,6 +10,12 @@ const clientId = computed(() => String(route.params.clientId || ''));
 const WIDGET_TYPES = [
   { id: 'stats-primary', label: 'System Stats', icon: '📊' },
   { id: 'stats-secondary', label: 'Disk / Network', icon: '💾' },
+  { id: 'cpu', label: 'CPU', icon: '🖥' },
+  { id: 'memory', label: 'Memory', icon: '🧠' },
+  { id: 'battery', label: 'Battery', icon: '🔋' },
+  { id: 'disk', label: 'Disk', icon: '💽' },
+  { id: 'network', label: 'Network', icon: '🌐' },
+  { id: 'system-health', label: 'System Health', icon: '❤️' },
   { id: 'weather-current', label: 'Weather', icon: '🌤' },
   { id: 'weather-forecast', label: '7-Day Forecast', icon: '📅' },
   { id: 'clock-calendar', label: 'Clock / Calendar', icon: '🕐' },
@@ -22,14 +28,17 @@ const WIDGET_TYPES = [
 ];
 
 const PRESETS = [
+  { name: 'system', label: 'System', desc: 'Host telemetry', cols: 3, rows: 2 },
   { name: 'ultrawide', label: 'Ultrawide', desc: '5120×1440', cols: 5, rows: 3 },
   { name: 'wide', label: 'Wide', desc: '2560×1440', cols: 3, rows: 3 },
   { name: 'classic', label: 'Classic', desc: '4:3', cols: 2, rows: 3 },
 ];
 
-const currentPreset = ref('ultrawide');
-const gridCols = ref(5);
-const gridRows = ref(3);
+// 'system' is also the agent's cold-start default (see kiosk.DefaultLayoutName),
+// so opening the editor shows what an unconfigured kiosk is already displaying.
+const currentPreset = ref('system');
+const gridCols = ref(3);
+const gridRows = ref(2);
 const widgets = ref([]);
 const units = ref('imperial');
 const saving = ref(false);
@@ -117,6 +126,14 @@ function loadLayoutFromStore(name) {
 
 function loadDefaultLayout(name) {
   const defaults = {
+    system: [
+      { type: 'cpu', col: 1, row: 1, w: 1, h: 1 },
+      { type: 'memory', col: 2, row: 1, w: 1, h: 1 },
+      { type: 'battery', col: 3, row: 1, w: 1, h: 1 },
+      { type: 'disk', col: 1, row: 2, w: 1, h: 1 },
+      { type: 'network', col: 2, row: 2, w: 1, h: 1 },
+      { type: 'system-health', col: 3, row: 2, w: 1, h: 1 },
+    ],
     ultrawide: [
       { type: 'stats-primary', col: 1, row: 1, w: 1, h: 1 },
       { type: 'weather-current', col: 2, row: 1, w: 1, h: 1 },
@@ -150,7 +167,7 @@ function loadDefaultLayout(name) {
       { type: 'iss-tracker', col: 2, row: 3, w: 1, h: 1 },
     ],
   };
-  widgets.value = (defaults[name] || defaults.ultrawide).map(w => ({ ...w }));
+  widgets.value = (defaults[name] || defaults.system).map(w => ({ ...w }));
 }
 
 function getWidgetLabel(type) {
