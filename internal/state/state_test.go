@@ -543,3 +543,94 @@ func TestStore_ForgettingClientEvictsCaches(t *testing.T) {
 		t.Error("variantStatus not evicted for a forgotten client")
 	}
 }
+
+// The dashboard renders client_list in the order the server sends it. Both
+// PublicClients sources are maps, and Go randomizes map iteration, so an
+// unsorted roster reshuffled on every connect/disconnect and hosts moved out
+// from under the pointer.
+func TestStore_PublicClientsIsDeterministicallyOrdered(t *testing.T) {
+	ids := []string{"zeta", "alpha", "mike", "bravo", "yankee", "charlie"}
+
+	s := New()
+	for _, id := range ids {
+		s.AddClient(id, nil)
+	}
+	// Take one offline so the lastSeen map contributes too.
+	s.RemoveClient("mike")
+
+	want := []string{"alpha", "bravo", "charlie", "mike", "yankee", "zeta"}
+
+	// Repeat: a single call can look sorted by luck under map randomization.
+	for i := 0; i < 25; i++ {
+		got := make([]string, 0, len(want))
+		for _, pub := range s.PublicClients() {
+			got = append(got, pub.ClientID)
+		}
+		if len(got) != len(want) {
+			t.Fatalf("iteration %d: got %d clients, want %d (%v)", i, len(got), len(want), got)
+		}
+		for j := range want {
+			if got[j] != want[j] {
+				t.Fatalf("iteration %d: PublicClients() order = %v, want %v", i, got, want)
+			}
+		}
+	}
+}
+
+func TestStore_ClientIDsIsSorted(t *testing.T) {
+	s := New()
+	for _, id := range []string{"delta", "alpha", "charlie", "bravo"} {
+		s.AddClient(id, nil)
+	}
+	want := []string{"alpha", "bravo", "charlie", "delta"}
+
+	for i := 0; i < 25; i++ {
+		got := s.ClientIDs()
+		for j := range want {
+			if got[j] != want[j] {
+				t.Fatalf("iteration %d: ClientIDs() = %v, want %v", i, got, want)
+			}
+		}
+	}
+}
+
+// A cluster's manager was whichever manager the map iteration reached first,
+// so an unchanged two-manager cluster could report a different manager on
+// consecutive calls — and its member list reordered under the same randomness.
+func TestStore_SwarmClustersIsDeterministic(t *testing.T) {
+	s := New()
+	members := map[string]string{
+		"node-c": "manager",
+		"node-a": "manager",
+		"node-b": "worker",
+		"node-d": "worker",
+	}
+	for id, role := range members {
+		s.AddClient(id, nil)
+		s.UpdateStats(id, map[string]any{
+			"swarmActive":    true,
+			"swarmClusterId": "cluster-1",
+			"swarmRole":      role,
+		})
+	}
+
+	for i := 0; i < 25; i++ {
+		clusters := s.SwarmClusters()
+		if len(clusters) != 1 {
+			t.Fatalf("iteration %d: got %d clusters, want 1", i, len(clusters))
+		}
+		if mgr, _ := clusters[0]["manager"].(string); mgr != "node-a" {
+			t.Fatalf("iteration %d: manager = %q, want the lowest-ID manager node-a", i, mgr)
+		}
+		list, _ := clusters[0]["members"].([]map[string]any)
+		want := []string{"node-a", "node-b", "node-c", "node-d"}
+		if len(list) != len(want) {
+			t.Fatalf("iteration %d: got %d members, want %d", i, len(list), len(want))
+		}
+		for j, id := range want {
+			if got, _ := list[j]["clientId"].(string); got != id {
+				t.Fatalf("iteration %d: member %d = %q, want %q", i, j, got, id)
+			}
+		}
+	}
+}

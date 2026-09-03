@@ -3,6 +3,7 @@ package state
 import (
 	"fmt"
 	"reflect"
+	"sort"
 	"sync"
 	"time"
 
@@ -26,9 +27,9 @@ const MaxOfflineClients = 256
 type ClientEntry struct {
 	Mu sync.Mutex
 
-	ClientID      string
-	Conn          *websocket.Conn // nil in tests
-	LastPong      time.Time
+	ClientID string
+	Conn     *websocket.Conn // nil in tests
+	LastPong time.Time
 	// RttMs is the most recent ping→pong round-trip in milliseconds, measured
 	// from the echoed ping timestamp. 0 until the first pong is received.
 	RttMs         int64
@@ -76,8 +77,8 @@ type CapabilityInfo struct {
 // PublicClient is the JSON-safe projection of a ClientEntry.
 // LastPong is Unix milliseconds (matching the Node.js server's Date.now() format).
 type PublicClient struct {
-	ClientID      string `json:"clientId"`
-	LastPong      int64  `json:"lastPong"`
+	ClientID string `json:"clientId"`
+	LastPong int64  `json:"lastPong"`
 	// Connected reports whether the agent's socket is open right now. False
 	// entries are retained last-known snapshots (see Store.lastSeen) so the
 	// dashboard can render a node as offline instead of having it vanish.
@@ -281,7 +282,9 @@ func (s *Store) GetClient(clientID string) *ClientEntry {
 	return s.clients[clientID]
 }
 
-// ClientIDs returns the list of connected client IDs.
+// ClientIDs returns the list of connected client IDs, sorted. Callers render
+// this directly, and Go randomizes map iteration order, so an unsorted result
+// reshuffles on every call.
 func (s *Store) ClientIDs() []string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -289,6 +292,7 @@ func (s *Store) ClientIDs() []string {
 	for id := range s.clients {
 		ids = append(ids, id)
 	}
+	sort.Strings(ids)
 	return ids
 }
 
@@ -353,6 +357,15 @@ func (s *Store) PublicClients() []PublicClient {
 		}
 		out = append(out, pub)
 	}
+
+	// Both sources above are maps, and Go randomizes map iteration order, so
+	// without this the roster comes back in a different order on every call.
+	// The dashboard renders client_list in the order it arrives, which made
+	// hosts swap places under the pointer on every connect/disconnect.
+	// Sorting by ID (not by connected-ness) keeps a host in the same row
+	// across a brief drop, so its position only moves when the fleet's
+	// membership actually changes.
+	sort.Slice(out, func(i, j int) bool { return out[i].ClientID < out[j].ClientID })
 	return out
 }
 
@@ -718,6 +731,16 @@ func (s *Store) SwarmClusters() []map[string]any {
 
 	out := make([]map[string]any, 0, len(clusters))
 	for cid, ci := range clusters {
+		// Members accumulate in map-iteration order, so sort before picking a
+		// manager: otherwise "the" manager of a multi-manager cluster is
+		// whichever one this call happened to visit first, and the answer
+		// changes between calls for an unchanged cluster.
+		sort.Slice(ci.members, func(i, j int) bool {
+			a, _ := ci.members[i]["clientId"].(string)
+			b, _ := ci.members[j]["clientId"].(string)
+			return a < b
+		})
+
 		var manager string
 		for _, m := range ci.members {
 			if r, _ := m["role"].(string); r == "manager" {
@@ -731,6 +754,11 @@ func (s *Store) SwarmClusters() []map[string]any {
 			"members":   ci.members,
 		})
 	}
+	sort.Slice(out, func(i, j int) bool {
+		a, _ := out[i]["clusterId"].(string)
+		b, _ := out[j]["clusterId"].(string)
+		return a < b
+	})
 	return out
 }
 
