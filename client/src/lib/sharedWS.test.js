@@ -2,7 +2,7 @@ import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   connected, clientIds, statsMap, on, send, __testInjectMessage,
   capabilitiesMap, clientHasCapability, clientCapabilityFeatures,
-  smsThreadsMap, smsMessagesMap, fetchSmsThreads, fetchSmsMessages, sendSms,
+  smsThreadsMap, smsMessagesMap, smsErrorMap, fetchSmsThreads, fetchSmsMessages, sendSms,
   statsHistory,
 } from './sharedWS.js';
 
@@ -107,6 +107,51 @@ describe('sharedWS SMS helpers', () => {
     vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false })));
     const result = await fetchSmsThreads('phone-1');
     expect(result).toEqual([]);
+  });
+
+  // A failed read used to be indistinguishable from an empty inbox: both
+  // rendered "No SMS history yet", so a server with no database configured
+  // looked exactly like a phone nobody had texted.
+  it('fetchSmsThreads records the server error message on failure', async () => {
+    delete smsErrorMap['phone-err'];
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false,
+      status: 503,
+      json: async () => ({ error: 'sms history unavailable (no database configured)' }),
+    })));
+
+    const result = await fetchSmsThreads('phone-err');
+    expect(result).toEqual([]);
+    expect(smsErrorMap['phone-err']).toBe('sms history unavailable (no database configured)');
+  });
+
+  it('fetchSmsThreads explains a 403 as an admin-gating problem', async () => {
+    delete smsErrorMap['phone-403'];
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: false, status: 403, json: async () => ({}) })));
+
+    await fetchSmsThreads('phone-403');
+    expect(smsErrorMap['phone-403']).toMatch(/admin/i);
+  });
+
+  it('fetchSmsThreads clears a stale error once a read succeeds', async () => {
+    smsErrorMap['phone-recover'] = 'previous failure';
+    vi.stubGlobal('fetch', vi.fn(async () => ({ ok: true, json: async () => ({ threads: [] }) })));
+
+    await fetchSmsThreads('phone-recover');
+    expect(smsErrorMap['phone-recover']).toBeUndefined();
+  });
+
+  it('fetchSmsMessages records a failure too', async () => {
+    delete smsErrorMap['phone-msg'];
+    vi.stubGlobal('fetch', vi.fn(async () => ({
+      ok: false,
+      status: 500,
+      json: async () => ({ error: 'failed to list messages' }),
+    })));
+
+    const result = await fetchSmsMessages('phone-msg', '7');
+    expect(result).toEqual([]);
+    expect(smsErrorMap['phone-msg']).toBe('failed to list messages');
   });
 
   it('fetchSmsMessages populates smsMessagesMap keyed by client:thread', async () => {

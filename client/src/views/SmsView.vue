@@ -2,7 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from 'vue';
 import { useRoute } from 'vue-router';
 import {
-  smsThreadsMap, smsMessagesMap,
+  smsThreadsMap, smsMessagesMap, smsErrorMap,
   fetchSmsThreads, fetchSmsMessages, sendSms,
   on as onWS,
 } from '../lib/sharedWS.js';
@@ -11,6 +11,7 @@ const route = useRoute();
 const clientId = computed(() => String(route.params.clientId || ''));
 
 const threads = computed(() => smsThreadsMap[clientId.value] || []);
+const loadError = computed(() => smsErrorMap[clientId.value] || '');
 const activeThreadId = ref(null);
 const activeThread = computed(() => threads.value.find(t => String(t.threadId) === String(activeThreadId.value)) || null);
 const messages = computed(() => smsMessagesMap[`${clientId.value}:${activeThreadId.value}`] || []);
@@ -39,6 +40,17 @@ watch(activeThreadId, async (threadId) => {
   }
 });
 
+// Select the newest conversation whenever one shows up and nothing is open.
+// loadThreads only auto-selects at mount, so the very first message to arrive
+// on a phone with no prior history landed in the sidebar while the
+// conversation pane still read "Select a conversation" — which looked like the
+// message had not arrived at all.
+watch(threads, (list) => {
+  if (!activeThreadId.value && !showNewConversation.value && list.length > 0) {
+    activeThreadId.value = list[0].threadId;
+  }
+});
+
 let unsubscribe;
 onMounted(async () => {
   await loadThreads();
@@ -46,7 +58,8 @@ onMounted(async () => {
     if (obj.clientId !== clientId.value) return;
     // The push doesn't carry a threadId, so refresh whatever's open — cheap
     // for SMS volumes, and keeps this simple (see sharedWS.js's own comment
-    // on the same tradeoff for the thread-list refresh).
+    // on the same tradeoff for the thread-list refresh). When nothing is open
+    // yet, the threads watcher above picks up the new conversation instead.
     if (activeThreadId.value) {
       fetchSmsMessages(clientId.value, activeThreadId.value);
     }
@@ -105,7 +118,10 @@ function formatTs(ts) {
           </button>
         </div>
         <div class="flex-1 overflow-y-auto divide-y divide-gray-100 dark:divide-gray-700">
-          <div v-if="threads.length === 0" class="p-4 text-sm text-gray-500 dark:text-gray-400">
+          <div v-if="loadError" class="p-4 text-sm text-red-600 dark:text-red-400">
+            {{ loadError }}
+          </div>
+          <div v-else-if="threads.length === 0" class="p-4 text-sm text-gray-500 dark:text-gray-400">
             No SMS history yet.
           </div>
           <button

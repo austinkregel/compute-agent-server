@@ -128,3 +128,36 @@ func TestHandleAgentEvent_SMSSendResult_ResolvesPendingAndBroadcasts(t *testing.
 		t.Error("expected sms_send_result to also be broadcast")
 	}
 }
+
+// Two phones on one control plane must not see each other's texts. Threads are
+// keyed by (clientId, address), so nothing but that scoping keeps them apart.
+func TestHandleAgentEvent_SMSReceived_ScopesHistoryPerClient(t *testing.T) {
+	r, _, _ := testRelay(t)
+	store := testSMSStore(t)
+	r.SetSMSStore(store)
+
+	now := float64(time.Now().UnixMilli())
+	r.HandleAgentEvent("phone-1", makeMsg("sms_received", map[string]any{
+		"address": "+15551111111", "body": "for phone one", "ts": now,
+	}))
+	r.HandleAgentEvent("phone-2", makeMsg("sms_received", map[string]any{
+		"address": "+15552222222", "body": "for phone two", "ts": now,
+	}))
+
+	for clientID, want := range map[string]string{"phone-1": "for phone one", "phone-2": "for phone two"} {
+		threads, err := store.ListThreads(clientID, 50)
+		if err != nil {
+			t.Fatalf("ListThreads(%s): %v", clientID, err)
+		}
+		if len(threads) != 1 {
+			t.Fatalf("%s: got %d threads, want only its own", clientID, len(threads))
+		}
+		messages, err := store.ListMessages(clientID, threads[0].ThreadID, 200)
+		if err != nil {
+			t.Fatalf("ListMessages(%s): %v", clientID, err)
+		}
+		if len(messages) != 1 || messages[0].Body != want {
+			t.Errorf("%s: messages = %+v, want exactly %q", clientID, messages, want)
+		}
+	}
+}

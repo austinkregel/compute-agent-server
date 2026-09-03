@@ -83,8 +83,51 @@ func TestLoad_AppliesDefaults(t *testing.T) {
 	if cfg.DatabaseDSN != "sqlite://./data/app.db" {
 		t.Errorf("DatabaseDSN = %q, want default sqlite DSN", cfg.DatabaseDSN)
 	}
+	if want := filepath.Join("data", "sms-encryption.key"); cfg.SMSEncryptionKeyFile != want {
+		t.Errorf("SMSEncryptionKeyFile = %q, want %q", cfg.SMSEncryptionKeyFile, want)
+	}
+}
+
+// The key defaults next to the database, not into the CWD: the container image
+// mounts /app/data but not /app, so a key in the CWD was discarded on every
+// container recreate while the database it decrypts survived.
+func TestLoad_SMSKeyDefaultsBesideDatabase(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	cfg := Config{DatabaseDSN: "sqlite://./var/lib/app.db"}
+	cfg.applyDefaults()
+
+	if want := filepath.Join("var", "lib", "sms-encryption.key"); cfg.SMSEncryptionKeyFile != want {
+		t.Errorf("SMSEncryptionKeyFile = %q, want %q", cfg.SMSEncryptionKeyFile, want)
+	}
+}
+
+// An existing key in the old location still owns every row already in the
+// database, so moving the default must not orphan it.
+func TestLoad_SMSKeyPrefersExistingLegacyFile(t *testing.T) {
+	dir := t.TempDir()
+	t.Chdir(dir)
+	if err := os.WriteFile(filepath.Join(dir, "sms-encryption.key"), []byte("existing"), 0o600); err != nil {
+		t.Fatalf("write legacy key: %v", err)
+	}
+
+	cfg := Config{}
+	cfg.applyDefaults()
+
 	if cfg.SMSEncryptionKeyFile != "sms-encryption.key" {
-		t.Errorf("SMSEncryptionKeyFile = %q, want default", cfg.SMSEncryptionKeyFile)
+		t.Errorf("SMSEncryptionKeyFile = %q, want the pre-existing legacy key", cfg.SMSEncryptionKeyFile)
+	}
+}
+
+// An explicit path always wins over either default.
+func TestLoad_SMSKeyExplicitPathWins(t *testing.T) {
+	t.Chdir(t.TempDir())
+
+	cfg := Config{SMSEncryptionKeyFile: "/etc/backup-server/sms.key"}
+	cfg.applyDefaults()
+
+	if cfg.SMSEncryptionKeyFile != "/etc/backup-server/sms.key" {
+		t.Errorf("SMSEncryptionKeyFile = %q, want the explicitly configured path", cfg.SMSEncryptionKeyFile)
 	}
 }
 

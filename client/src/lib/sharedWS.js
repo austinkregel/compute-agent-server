@@ -83,6 +83,12 @@ export const smsThreadsMap = reactive({});
 // Per-(client, thread) message history
 // `${clientId}:${threadId}` -> [{ messageId, threadId, address, direction, body, status, timestamp }]
 export const smsMessagesMap = reactive({});
+// Why the last SMS read for a client failed, if it did. clientId -> message.
+// Without this a 503 (server has no database configured), a 403 (session
+// isn't admin) and a genuinely empty inbox all render as "No SMS history
+// yet", which is the difference between "nobody has texted you" and "your
+// history is not being stored at all".
+export const smsErrorMap = reactive({});
 // Per-client ring buffer of recent critical/error OS alerts (for notifications/toast)
 // clientId -> [{ id, ts, severity, category, message, source, count }]
 export const osAlertHistory = reactive({});
@@ -397,12 +403,31 @@ export async function fetchSmsThreads(clientId) {
       credentials: 'include',
       headers: { 'Accept': 'application/json' }
     });
-    if (!res.ok) return [];
+    if (!res.ok) {
+      smsErrorMap[clientId] = await readApiError(res, 'Failed to load SMS history');
+      return [];
+    }
     const json = await res.json();
     const threads = json.threads || [];
     smsThreadsMap[clientId] = threads;
+    delete smsErrorMap[clientId];
     return threads;
-  } catch { return []; }
+  } catch (e) {
+    smsErrorMap[clientId] = e?.message || 'Network error loading SMS history';
+    return [];
+  }
+}
+
+// Pulls the server's own error message out of a failed response, falling back
+// to the status when the body isn't the usual { error } JSON.
+async function readApiError(res, fallback) {
+  let json = null;
+  if (typeof res.json === 'function') {
+    json = await res.json().catch(() => null);
+  }
+  if (json && json.error) return json.error;
+  if (res.status === 403) return 'Your account is not an admin; SMS history is admin-only.';
+  return res.status ? `${fallback} (HTTP ${res.status})` : fallback;
 }
 
 // Fetch messages within one SMS thread from REST API
@@ -413,12 +438,19 @@ export async function fetchSmsMessages(clientId, threadId) {
       `/api/client/${encodeURIComponent(clientId)}/sms/threads/${encodeURIComponent(threadId)}/messages`,
       { credentials: 'include', headers: { 'Accept': 'application/json' } }
     );
-    if (!res.ok) return [];
+    if (!res.ok) {
+      smsErrorMap[clientId] = await readApiError(res, 'Failed to load messages');
+      return [];
+    }
     const json = await res.json();
     const messages = json.messages || [];
     smsMessagesMap[`${clientId}:${threadId}`] = messages;
+    delete smsErrorMap[clientId];
     return messages;
-  } catch { return []; }
+  } catch (e) {
+    smsErrorMap[clientId] = e?.message || 'Network error loading messages';
+    return [];
+  }
 }
 
 // Send an SMS via a client's companion app. Returns the parsed response body

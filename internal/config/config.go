@@ -237,11 +237,37 @@ func (c *Config) applyDefaults() {
 		c.DatabaseDSN = "sqlite://./data/app.db"
 	}
 	if c.SMSEncryptionKeyFile == "" {
-		c.SMSEncryptionKeyFile = "sms-encryption.key"
+		c.SMSEncryptionKeyFile = defaultSMSKeyPath(c.DatabaseDSN)
 	}
 	if c.AuditLogFile == "" {
 		c.AuditLogFile = filepath.Join(".", "audit.jsonl")
 	}
+}
+
+// legacySMSKeyPath is where the SMS encryption key defaulted before it moved
+// next to the database. A file there still owns every row already in the
+// database, so it keeps precedence over the new location.
+const legacySMSKeyPath = "sms-encryption.key"
+
+// defaultSMSKeyPath puts the SMS encryption key beside the sqlite database
+// rather than in the working directory.
+//
+// The container image mounts /app/data as a volume but not /app (see
+// server/Dockerfile), so a key in the CWD lives only in the container's
+// writable layer: recreating the container for an upgrade discarded the key
+// while the database survived, leaving every persisted thread and message
+// decryptable by nothing and silently minting a fresh key for the next batch.
+func defaultSMSKeyPath(dsn string) string {
+	if _, err := os.Stat(legacySMSKeyPath); err == nil {
+		return legacySMSKeyPath
+	}
+	dir := "data"
+	if path, ok := strings.CutPrefix(dsn, "sqlite://"); ok {
+		if d := filepath.Dir(path); d != "" && d != "." {
+			dir = d
+		}
+	}
+	return filepath.Join(dir, "sms-encryption.key")
 }
 
 func (c *Config) applyEnvOverrides() {
