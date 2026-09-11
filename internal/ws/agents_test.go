@@ -515,3 +515,78 @@ func TestWithActor_AgentSeesOriginalFields(t *testing.T) {
 		}
 	}
 }
+
+// TestAgentHandler_ReconnectKeepsLiveSession covers the reconnect race that
+// leaves an agent connected but off the roster: a power-cut never closes the
+// agent's socket, so the agent reconnects while the previous handler is still
+// parked in Read. When that stale handler finally unwinds, its cleanup must not
+// evict the session that replaced it — nothing would recover, because the live
+// socket is healthy and the agent has no reason to reconnect.
+func TestAgentHandler_ReconnectKeepsLiveSession(t *testing.T) {
+	server, store, handler := setupAgentServer(t)
+
+	disconnects := make(chan string, 4)
+	handler.OnDisconnect = func(clientID string) { disconnects <- clientID }
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// First session, as if established before the power-cut.
+	stale := dialAgent(t, server.URL, "node-1")
+	if _, _, err := stale.Read(ctx); err != nil {
+		t.Fatalf("read hello_ack on first connection: %v", err)
+	}
+
+	// The agent comes back on a new socket while the old one is still open.
+	live := dialAgent(t, server.URL, "node-1")
+	if _, _, err := live.Read(ctx); err != nil {
+		t.Fatalf("read hello_ack on second connection: %v", err)
+	}
+
+	// The stale socket unwinds — either because the server retired it on
+	// registration, or because the dead TCP connection is finally reaped.
+	stale.Close(websocket.StatusAbnormalClosure, "power cut")
+
+	// Let the stale handler run its cleanup.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(disconnects) > 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if !store.HasClient("node-1") {
+		t.Fatal("live session was evicted by the stale handler's cleanup")
+	}
+	select {
+	case id := <-disconnects:
+		t.Fatalf("OnDisconnect fired for %q while the agent is still connected", id)
+	default:
+	}
+
+	// The registered entry must be the live socket, not the retired one: a
+	// pong on it still has to land, or the heartbeat evicts a healthy agent.
+	entry := store.GetClient("node-1")
+	entry.Mu.Lock()
+	before := entry.LastPong
+	entry.Mu.Unlock()
+
+	time.Sleep(10 * time.Millisecond)
+	pong, _ := Encode("pong", map[string]any{"ts": time.Now().UnixMilli()})
+	if err := live.Write(ctx, websocket.MessageText, pong); err != nil {
+		t.Fatalf("write pong on live connection: %v", err)
+	}
+
+	deadline = time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		entry.Mu.Lock()
+		after := entry.LastPong
+		entry.Mu.Unlock()
+		if after.After(before) {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("pong on the live connection did not reach the registered session")
+}

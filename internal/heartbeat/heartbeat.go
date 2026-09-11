@@ -66,10 +66,16 @@ func (t *Ticker) tick() {
 
 	for _, c := range clients {
 		if now.Sub(c.LastPong()) > t.config.PongTimeout {
-			t.store.EvictClient(c.ClientID())
+			// OnEvict runs first, and deliberately so: it closes the agent's
+			// socket, which it can only find by looking the client up — and
+			// EvictClient is what drops that entry. Closing is the whole point
+			// of the callback. An evicted agent whose socket stays open never
+			// learns it left the roster, so it never reconnects and stays
+			// unreachable until its process restarts.
 			if t.config.OnEvict != nil {
 				t.config.OnEvict(c.ClientID())
 			}
+			t.store.EvictClient(c.ClientID())
 			continue
 		}
 		// Ping active clients (ignore errors — the next tick will evict if no pong)
