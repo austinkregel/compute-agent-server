@@ -9,9 +9,9 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/auth"
-	"github.com/austinkregel/backup-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/auth"
+	"github.com/austinkregel/compute-agent-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/cmdsig"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
@@ -291,7 +291,7 @@ func (h *AgentHandler) readLoop(ctx context.Context, clientID string, conn *webs
 // a person: allowlist pushes on agent connect, release-webhook fan-out, session
 // cleanup on disconnect. It is a principal name, not a credential; no HTTP
 // route accepts it.
-const ActorSystem = "system:backup-server"
+const ActorSystem = "system:compute-agent-server"
 
 // actorPayloadKey carries the acting principal inside the signed payload.
 //

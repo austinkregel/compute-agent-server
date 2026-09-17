@@ -16,7 +16,7 @@ import (
 
 	"nhooyr.io/websocket"
 
-	"github.com/austinkregel/backup-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/cmdsig"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )

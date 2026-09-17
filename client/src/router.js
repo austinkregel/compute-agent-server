@@ -6,7 +6,6 @@ import ExecAllowlistView from './views/ExecAllowlistView.vue';
 import AuditView from './views/AuditView.vue';
 import ActionsView from './views/ActionsView.vue';
 import LogsView from './views/LogsView.vue';
-import BackupsView from './views/BackupsView.vue';
 import SmsView from './views/SmsView.vue';
 import KioskView from './views/KioskView.vue';
 import FleetView from './views/FleetView.vue';
@@ -63,11 +62,6 @@ const router = createRouter({
     { 
       path: '/client/:clientId', 
       component: DashboardView,
-      meta: { requiresAuth: true }
-    },
-    {
-      path: '/client/:clientId/backups',
-      component: BackupsView,
       meta: { requiresAuth: true }
     },
     {

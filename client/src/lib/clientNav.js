@@ -5,7 +5,7 @@
 
 /**
  * Compute the target path when switching to a different client.
- * Preserves the current sub-page (e.g., /actions, /logs, /backups) if on a client route.
+ * Preserves the current sub-page (e.g., /actions, /logs) if on a client route.
  * 
  * @param {object} opts
  * @param {string} opts.currentPath - Current route path (e.g., '/client/abc/actions')

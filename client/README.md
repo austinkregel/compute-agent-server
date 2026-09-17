@@ -1,6 +1,6 @@
 # Dashboard
 
-The operator dashboard for Backup Server: a Vue 3 + Vite SPA that shows fleet
+The operator dashboard for Compute Agent: a Vue 3 + Vite SPA that shows fleet
 telemetry, opens remote shells, browses agent filesystems, and drives kiosk
 displays. It is its own npm package, nested under `server/` so the control plane
 builds and ships as one unit.

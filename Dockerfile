@@ -1,6 +1,6 @@
 # Build with server/ itself as context, e.g.:
-#   docker build -t backup-server .        (run from within server/)
-#   docker build -f server/Dockerfile -t backup-server server/   (run from repo root)
+#   docker build -t compute-agent-server .        (run from within server/)
+#   docker build -f server/Dockerfile -t compute-agent-server server/   (run from repo root)
 #
 # server/ depends on github.com/austinkregel/compute-agent as a real published
 # module (see go.mod) rather than a local checkout, so this build needs
@@ -20,13 +20,13 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
-RUN CGO_ENABLED=0 go build -o /out/backup-server ./cmd/server
+RUN CGO_ENABLED=0 go build -o /out/compute-agent-server ./cmd/server
 
 # ---- Stage 3: runtime ----
 FROM gcr.io/distroless/base-debian12 AS runtime
 ENV TZ=UTC
 WORKDIR /app
-COPY --from=go-build /out/backup-server /app/backup-server
+COPY --from=go-build /out/compute-agent-server /app/compute-agent-server
 COPY --from=client-build /src/client/dist /app/client/dist
 # server-config.json (SERVER_CONFIG_PATH), data/ (sqlite DSN default), and
 # certs/ (optional TLS pair — falls back to plain HTTP if absent) are all
@@ -38,5 +38,5 @@ EXPOSE 8443
 # covers OIDC discovery, which retries with backoff for up to 5 minutes before
 # the listener binds (internal/server.New).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=330s --retries=3 \
-  CMD ["/app/backup-server", "--healthcheck"]
-ENTRYPOINT ["/app/backup-server"]
+  CMD ["/app/compute-agent-server", "--healthcheck"]
+ENTRYPOINT ["/app/compute-agent-server"]

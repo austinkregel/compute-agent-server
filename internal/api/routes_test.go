@@ -8,10 +8,10 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/austinkregel/backup-server/internal/allowlist"
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/config"
-	"github.com/austinkregel/backup-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/allowlist"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/state"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 

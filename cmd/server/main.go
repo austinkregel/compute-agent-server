@@ -13,15 +13,15 @@ import (
 
 	"github.com/joho/godotenv"
 
-	"github.com/austinkregel/backup-server/internal/config"
-	"github.com/austinkregel/backup-server/internal/server"
+	"github.com/austinkregel/compute-agent-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/server"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 	"github.com/austinkregel/compute-agent/pkg/version"
 )
 
 // printVersion prints the version information.
 func printVersion() {
-	fmt.Printf("backup-server %s (%s) built=%s\n", version.Version, version.Commit, version.BuildDate)
+	fmt.Printf("compute-agent-server %s (%s) built=%s\n", version.Version, version.Commit, version.BuildDate)
 }
 
 // handleVersionFlag returns true if the program should exit after printing version.
@@ -106,7 +106,7 @@ func main() {
 	}
 	defer log.Sync()
 
-	log.Info("backup-server starting",
+	log.Info("compute-agent-server starting",
 		"version", version.Short(),
 		"port", cfg.Port,
 		"oidc_enabled", cfg.OIDC.Enabled,
@@ -126,5 +126,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("backup-server stopped")
+	log.Info("compute-agent-server stopped")
 }

@@ -9,8 +9,8 @@
       <button @click="validate" type="button" class="px-3 py-1.5 text-xs rounded-md bg-indigo-600 hover:bg-indigo-700 text-white disabled:opacity-50 transition-colors" :disabled="loading">Validate</button>
       <button @click="save" type="button" class="px-3 py-1.5 text-xs rounded-md bg-green-600 hover:bg-green-700 text-white disabled:opacity-50 transition-colors" :disabled="loading || !dirty">Save</button>
     </div>
-    <textarea v-model="content" @input="onInput" rows="10" class="w-full font-mono text-xs rounded-md border border-gray-300 dark:border-gray-600 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-900 dark:text-gray-100 p-3" placeholder="# Example: Run backup at 3:05 daily
-5 3 * * * /usr/local/bin/backup-script >> /var/log/backup.log 2>&1"></textarea>
+    <textarea v-model="content" @input="onInput" rows="10" class="w-full font-mono text-xs rounded-md border border-gray-300 dark:border-gray-600 focus:ring-2 focus:ring-indigo-500 focus:border-indigo-500 dark:bg-gray-900 dark:text-gray-100 p-3" placeholder="# Example: Prune logs at 3:05 daily
+5 3 * * * /usr/local/bin/prune-logs >> /var/log/prune-logs.log 2>&1"></textarea>
     <ul v-if="errors.length" class="space-y-1">
       <li v-for="e in errors" :key="e.line" class="text-xs text-red-600 dark:text-red-400">Line {{ e.line }}: {{ e.error }}</li>
     </ul>

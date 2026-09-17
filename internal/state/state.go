@@ -119,20 +119,6 @@ type LogTailSession struct {
 	CreatedAt time.Time
 }
 
-// BackupJob tracks a backup plan/execution.
-type BackupJob struct {
-	ClientID       string         `json:"clientId"`
-	PlanID         string         `json:"planId"`
-	Job            map[string]any `json:"job,omitempty"`
-	Plan           map[string]any `json:"plan,omitempty"`
-	Status         string         `json:"status"` // planning, planned, running, completed, failed
-	FilesCompleted int            `json:"filesCompleted"`
-	CompletedAt    string         `json:"completedAt,omitempty"`
-	DurationMs     int64          `json:"durationMs,omitempty"`
-	TransferBytes  int64          `json:"transferredBytes,omitempty"`
-	Error          string         `json:"error,omitempty"`
-}
-
 // PendingFileOp tracks an in-flight file operation.
 type PendingFileOp struct {
 	ClientID   string
@@ -171,9 +157,6 @@ type Store struct {
 	logTailMu       sync.RWMutex
 	logTailSessions map[string]*LogTailSession
 
-	backupMu   sync.RWMutex
-	backupJobs map[string]*BackupJob
-
 	fileOpMu       sync.RWMutex
 	pendingFileOps map[string]*PendingFileOp
 }
@@ -190,7 +173,6 @@ func New() *Store {
 		variantStatus:   make(map[string]map[string]any),
 		shellSessions:   make(map[string]*ShellSession),
 		logTailSessions: make(map[string]*LogTailSession),
-		backupJobs:      make(map[string]*BackupJob),
 		pendingFileOps:  make(map[string]*PendingFileOp),
 	}
 }
@@ -694,22 +676,6 @@ func (s *Store) RemoveLogTailSession(sessionID string) {
 	s.logTailMu.Lock()
 	defer s.logTailMu.Unlock()
 	delete(s.logTailSessions, sessionID)
-}
-
-// --- Backup Jobs ---
-
-// SetBackupJob stores a backup job.
-func (s *Store) SetBackupJob(planID string, job *BackupJob) {
-	s.backupMu.Lock()
-	defer s.backupMu.Unlock()
-	s.backupJobs[planID] = job
-}
-
-// GetBackupJob returns a backup job by plan ID.
-func (s *Store) GetBackupJob(planID string) *BackupJob {
-	s.backupMu.RLock()
-	defer s.backupMu.RUnlock()
-	return s.backupJobs[planID]
 }
 
 // --- Pending File Operations ---

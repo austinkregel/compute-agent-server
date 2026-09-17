@@ -17,14 +17,14 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/austinkregel/backup-server/internal/allowlist"
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/auth"
-	"github.com/austinkregel/backup-server/internal/config"
-	"github.com/austinkregel/backup-server/internal/database"
-	"github.com/austinkregel/backup-server/internal/relay"
-	"github.com/austinkregel/backup-server/internal/state"
-	"github.com/austinkregel/backup-server/internal/ws"
+	"github.com/austinkregel/compute-agent-server/internal/allowlist"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/auth"
+	"github.com/austinkregel/compute-agent-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/database"
+	"github.com/austinkregel/compute-agent-server/internal/relay"
+	"github.com/austinkregel/compute-agent-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/ws"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 

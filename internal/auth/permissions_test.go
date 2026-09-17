@@ -7,7 +7,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/austinkregel/backup-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/config"
 )
 
 func providerWith(cfg config.OIDCConfig) *OIDCProvider {

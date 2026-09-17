@@ -60,7 +60,6 @@
           <div class="text-xs font-medium uppercase tracking-wide text-gray-500 dark:text-gray-400 mb-1">OS Updates</div>
           <div class="text-2xl font-bold mb-1" :class="updatesHealthColor">{{ updatesPrimary }}</div>
           <div class="text-xs text-gray-500 dark:text-gray-400 mb-3 truncate">{{ updatesSubtitle }}</div>
-          <Sparkline :data="backupSeries" :width="200" :height="32" class="text-green-500 dark:text-green-400" :label="`Backups count trend for ${activeClient.clientId}`" />
         </div>
       </div>
 
@@ -103,7 +102,6 @@ const cpuSeries = computed(() => tail(history.value).map(s => s.load?.['1m'] ?? 
 const memPctSeries = computed(() => tail(history.value).map(s => {
   const m = s.mem; return m ? (m.used / m.total) * 100 : 0;
 }));
-const backupSeries = computed(() => tail(history.value).map(s => (s.backups ?? 0)));
 
 const lastUpdatedLocal = computed(() => {
   if (!history.value.length) return '';

@@ -1,4 +1,4 @@
-# Standalone run of the containerized backup-server (server/ + server/client/
+# Standalone run of the containerized compute-agent-server (server/ + server/client/
 # built into ghcr.io/austinkregel/compute-agent-server).
 #
 # Build locally:  docker compose -f server/docker-compose.yml build
@@ -27,12 +27,12 @@
 # 8443 (from server-config.json), same as the bare-metal process did.
 
 services:
-  backup-server:
+  compute-agent-server:
     build:
       context: .
       dockerfile: Dockerfile
     image: ghcr.io/austinkregel/compute-agent-server:latest
-    container_name: backup-server
+    container_name: compute-agent-server
     restart: unless-stopped
     network_mode: host
     # audit.jsonl defaults to the container filesystem; keep it on the data
@@ -44,19 +44,19 @@ services:
     # /healthz. start_period covers OIDC discovery, which retries with backoff
     # for up to 5 minutes before the listener binds (internal/server.New).
     healthcheck:
-      test: ["CMD", "/app/backup-server", "--healthcheck"]
+      test: ["CMD", "/app/compute-agent-server", "--healthcheck"]
       interval: 30s
       timeout: 5s
       start_period: 330s
       retries: 3
     volumes:
       - ./server-config.json:/app/server-config.json:ro
-      - backup-server-data:/app/data
+      - compute-agent-server-data:/app/data
       # Optional: mount a cert/key pair here to enable TLS (fullchain.pem +
       # privkey.pem). An absent certs dir runs plain HTTP; an unloadable cert
       # is fatal. Also where internal/traefikcert writes certs extracted from
       # Traefik.
-      - backup-server-certs:/app/certs
+      - compute-agent-server-certs:/app/certs
       # Traefik's ACME store (read-only) and file-provider dynamic-config dir
       # (read-write, for self-registration) — see comment above. Both no-op
       # unless tlsDomain is also set in server-config.json.
@@ -64,8 +64,8 @@ services:
       - homelab-traefik-dynamic:/traefik-dynamic
 
 volumes:
-  backup-server-data:
-  backup-server-certs:
+  compute-agent-server-data:
+  compute-agent-server-certs:
   homelab-traefik-certs:
     external: true
   homelab-traefik-dynamic:

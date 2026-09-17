@@ -14,7 +14,7 @@ import (
 	"github.com/go-jose/go-jose/v4"
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 
-	"github.com/austinkregel/backup-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/config"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 

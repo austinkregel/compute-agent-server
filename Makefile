@@ -1,5 +1,5 @@
 BINDIR  ?= dist
-APP     ?= backup-server
+APP     ?= compute-agent-server
 GOFLAGS ?=
 
 # ---------- Build ----------
@@ -78,7 +78,7 @@ client:
 
 .PHONY: docker
 docker:
-	docker build -t backup-server -f Dockerfile .
+	docker build -t compute-agent-server -f Dockerfile .
 
 # ---------- Clean ----------
 

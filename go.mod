@@ -1,4 +1,4 @@
-module github.com/austinkregel/backup-server
+module github.com/austinkregel/compute-agent-server
 
 go 1.25.0
 

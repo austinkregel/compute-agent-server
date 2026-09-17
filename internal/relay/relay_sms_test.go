@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/austinkregel/backup-server/internal/database"
+	"github.com/austinkregel/compute-agent-server/internal/database"
 )
 
 func testSMSStore(t *testing.T) *database.SMSStore {

@@ -6,7 +6,7 @@
           Sign in to Dashboard
         </h2>
         <p class="mt-2 text-center text-sm text-gray-600 dark:text-gray-400 dark:bg-gray-900">
-          Please authenticate to access the backup server dashboard
+          Please authenticate to access the Compute Agent dashboard
         </p>
       </div>
       <div class="mt-8 space-y-6">

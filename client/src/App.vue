@@ -77,7 +77,7 @@ function tabClass(active) {
       <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
         <div class="flex justify-between items-center h-16">
           <div class="flex items-center space-x-4">
-            <router-link to="/" class="text-xl font-semibold hover:opacity-80 transition-opacity" :class="dark ? 'text-gray-100':'text-gray-900'">Backup Server</router-link>
+            <router-link to="/" class="text-xl font-semibold hover:opacity-80 transition-opacity" :class="dark ? 'text-gray-100':'text-gray-900'">Compute Agent</router-link>
             <router-link
               to="/fleet"
               class="px-2.5 py-1 rounded text-xs font-medium border transition-colors"
@@ -135,9 +135,6 @@ function tabClass(active) {
         <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-2 flex items-center gap-2">
           <router-link :to="clientBase" :class="tabClass(route.path === clientBase)">
             Dashboard
-          </router-link>
-          <router-link :to="`${clientBase}/backups`" :class="tabClass(route.path.endsWith('/backups'))">
-            Backups
           </router-link>
           <router-link v-if="showSmsTab" :to="`${clientBase}/sms`" :class="tabClass(route.path.endsWith('/sms'))">
             SMS

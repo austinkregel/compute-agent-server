@@ -274,24 +274,6 @@ func TestStore_ShellSessionsByClient(t *testing.T) {
 	}
 }
 
-func TestStore_BackupJobs(t *testing.T) {
-	s := New()
-	job := &BackupJob{
-		ClientID: "node-1",
-		PlanID:   "plan-123",
-		Status:   "planning",
-	}
-	s.SetBackupJob("plan-123", job)
-
-	got := s.GetBackupJob("plan-123")
-	if got == nil {
-		t.Fatal("GetBackupJob() = nil after Set")
-	}
-	if got.Status != "planning" {
-		t.Errorf("Status = %q", got.Status)
-	}
-}
-
 func TestStore_PendingFileOps(t *testing.T) {
 	s := New()
 	op := &PendingFileOp{
