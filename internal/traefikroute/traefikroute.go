@@ -17,16 +17,16 @@ import (
 // worth a config field.
 const certResolverName = "letsencrypt"
 
-const routerFileName = "backup-server.json"
+const routerFileName = "compute-agent-server.json"
 
 // resourceName is the shared name for the router, service, and
 // serversTransport this package registers.
-const resourceName = "backup-server"
+const resourceName = "compute-agent-server"
 
 // WriteRouterConfig renders a Traefik file-provider config registering a
 // router for Host(`domain`) with TLS via certResolverName, proxying to a
 // single-server service at backendURL, and atomically writes it to
-// dynamicDir/backup-server.json.
+// dynamicDir/compute-agent-server.json.
 //
 // The service is bound to a serversTransport pinning serverName to domain.
 // backendURL normally addresses the backend by IP (the Docker network

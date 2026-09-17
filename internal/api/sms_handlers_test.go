@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/austinkregel/backup-server/internal/database"
-	"github.com/austinkregel/backup-server/internal/relay"
+	"github.com/austinkregel/compute-agent-server/internal/database"
+	"github.com/austinkregel/compute-agent-server/internal/relay"
 )
 
 func testDepsWithSMS(t *testing.T) Deps {
@@ -25,7 +25,7 @@ func testDepsWithSMS(t *testing.T) Deps {
 		t.Fatalf("LoadOrCreateKey: %v", err)
 	}
 	deps.SMS = database.NewSMSStore(db, key)
-	deps.Relay = relay.New(deps.Store, deps.Log, noopDash{}, t.TempDir())
+	deps.Relay = relay.New(deps.Store, deps.Log, noopDash{})
 	return deps
 }
 
@@ -36,7 +36,7 @@ func (noopDash) SendTo(connID string, event string, data any) bool { return fals
 
 func TestHandleSMSThreads_NoStoreConfigured(t *testing.T) {
 	deps := testDeps(t) // no SMS store
-	deps.Relay = relay.New(deps.Store, deps.Log, noopDash{}, t.TempDir())
+	deps.Relay = relay.New(deps.Store, deps.Log, noopDash{})
 	r := NewRouter(deps, PassThrough)
 
 	w := doRequest(t, r, "GET", "/api/client/phone-1/sms/threads", "")

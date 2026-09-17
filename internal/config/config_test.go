@@ -123,17 +123,17 @@ func TestLoad_SMSKeyPrefersExistingLegacyFile(t *testing.T) {
 func TestLoad_SMSKeyExplicitPathWins(t *testing.T) {
 	t.Chdir(t.TempDir())
 
-	cfg := Config{SMSEncryptionKeyFile: "/etc/backup-server/sms.key"}
+	cfg := Config{SMSEncryptionKeyFile: "/etc/compute-agent-server/sms.key"}
 	cfg.applyDefaults()
 
-	if cfg.SMSEncryptionKeyFile != "/etc/backup-server/sms.key" {
+	if cfg.SMSEncryptionKeyFile != "/etc/compute-agent-server/sms.key" {
 		t.Errorf("SMSEncryptionKeyFile = %q, want the explicitly configured path", cfg.SMSEncryptionKeyFile)
 	}
 }
 
 func TestLoad_EnvOverrideDatabaseDSN(t *testing.T) {
 	t.Setenv("DATABASE_DSN", "postgres://user:pass@localhost/db")
-	t.Setenv("SMS_ENCRYPTION_KEY_FILE", "/etc/backup-server/sms.key")
+	t.Setenv("SMS_ENCRYPTION_KEY_FILE", "/etc/compute-agent-server/sms.key")
 
 	p := writeTestConfig(t, `{"port": 8443, "authToken": "secret", "insecureAllowUnauthenticated": true}`)
 	cfg, err := Load(p)
@@ -143,7 +143,7 @@ func TestLoad_EnvOverrideDatabaseDSN(t *testing.T) {
 	if cfg.DatabaseDSN != "postgres://user:pass@localhost/db" {
 		t.Errorf("DatabaseDSN = %q, want env override", cfg.DatabaseDSN)
 	}
-	if cfg.SMSEncryptionKeyFile != "/etc/backup-server/sms.key" {
+	if cfg.SMSEncryptionKeyFile != "/etc/compute-agent-server/sms.key" {
 		t.Errorf("SMSEncryptionKeyFile = %q, want env override", cfg.SMSEncryptionKeyFile)
 	}
 }

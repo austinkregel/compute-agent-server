@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/auth"
-	"github.com/austinkregel/backup-server/internal/state"
-	"github.com/austinkregel/backup-server/internal/ws"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/auth"
+	"github.com/austinkregel/compute-agent-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/ws"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 
@@ -93,7 +93,7 @@ func testRelay(t *testing.T) (*Relay, *mockDash, *state.Store) {
 	t.Cleanup(func() { log.Sync() })
 
 	md := newMockDash()
-	r := New(store, log, md, t.TempDir())
+	r := New(store, log, md)
 	return r, md, store
 }
 
@@ -370,140 +370,6 @@ func TestLogTailOutput_Routed(t *testing.T) {
 	}
 }
 
-// --- Backup tests ---
-
-func TestBackupPlanRequest_Success(t *testing.T) {
-	r, _, store := testRelay(t)
-	store.AddClient("node-1", nil)
-	dc := newMockDC("dash-1")
-
-	r.HandleDashboardEvent(dc, makeMsg("backup_plan_request", map[string]any{
-		"clientId": "node-1", "destination": "/backups",
-	}))
-
-	r.backupMu.RLock()
-	count := len(r.backupJobs)
-	var job *backupJob
-	for _, j := range r.backupJobs {
-		job = j
-	}
-	r.backupMu.RUnlock()
-
-	if count != 1 {
-		t.Fatalf("backup jobs = %d, want 1", count)
-	}
-	if job.Status != "planning" {
-		t.Errorf("status = %q, want planning", job.Status)
-	}
-	if job.ClientID != "node-1" {
-		t.Errorf("clientID = %q", job.ClientID)
-	}
-}
-
-func TestBackupApprove_Success(t *testing.T) {
-	r, md, store := testRelay(t)
-	store.AddClient("node-1", nil)
-	dc := newMockDC("dash-1")
-
-	r.HandleDashboardEvent(dc, makeMsg("backup_plan_request", map[string]any{"clientId": "node-1"}))
-
-	r.backupMu.RLock()
-	var planID string
-	for id := range r.backupJobs {
-		planID = id
-	}
-	r.backupMu.RUnlock()
-
-	r.HandleDashboardEvent(dc, makeMsg("backup_approve", map[string]any{"planId": planID}))
-
-	r.backupMu.RLock()
-	job := r.backupJobs[planID]
-	r.backupMu.RUnlock()
-
-	if job.Status != "running" {
-		t.Errorf("status = %q, want running", job.Status)
-	}
-
-	msg := md.findBroadcast("backup_started")
-	if msg == nil {
-		t.Error("backup_started not broadcast")
-	}
-}
-
-func TestBackupComplete(t *testing.T) {
-	r, md, store := testRelay(t)
-	store.AddClient("node-1", nil)
-	dc := newMockDC("dash-1")
-
-	r.HandleDashboardEvent(dc, makeMsg("backup_plan_request", map[string]any{"clientId": "node-1"}))
-
-	r.backupMu.RLock()
-	var planID string
-	for id := range r.backupJobs {
-		planID = id
-	}
-	r.backupMu.RUnlock()
-
-	r.HandleAgentEvent("node-1", makeMsg("backup_complete", map[string]any{
-		"planId": planID, "ok": true, "ms": float64(1234),
-	}))
-
-	r.backupMu.RLock()
-	job := r.backupJobs[planID]
-	r.backupMu.RUnlock()
-
-	if job.Status != "completed" {
-		t.Errorf("status = %q, want completed", job.Status)
-	}
-
-	msg := md.findBroadcast("backup_complete")
-	if msg == nil {
-		t.Error("backup_complete not broadcast")
-	}
-}
-
-func TestBackupProgress_IncrementsCount(t *testing.T) {
-	r, md, store := testRelay(t)
-	store.AddClient("node-1", nil)
-	dc := newMockDC("dash-1")
-
-	r.HandleDashboardEvent(dc, makeMsg("backup_plan_request", map[string]any{"clientId": "node-1"}))
-
-	r.backupMu.RLock()
-	var planID string
-	for id := range r.backupJobs {
-		planID = id
-	}
-	r.backupMu.RUnlock()
-
-	r.HandleAgentEvent("node-1", makeMsg("backup_progress", map[string]any{
-		"planId": planID, "file": "test.txt", "percent": float64(50),
-	}))
-	r.HandleAgentEvent("node-1", makeMsg("backup_progress", map[string]any{
-		"planId": planID, "file": "test2.txt", "percent": float64(100),
-	}))
-
-	r.backupMu.RLock()
-	job := r.backupJobs[planID]
-	r.backupMu.RUnlock()
-	if job.FilesCompleted != 2 {
-		t.Errorf("filesCompleted = %d, want 2", job.FilesCompleted)
-	}
-
-	// Last broadcast should have filesCompleted
-	msgs := md.broadcasts
-	var lastProgress *sentMsg
-	for i := range msgs {
-		if msgs[i].Event == "backup_progress" {
-			lastProgress = &msgs[i]
-		}
-	}
-	if lastProgress == nil {
-		t.Fatal("backup_progress not broadcast")
-	}
-}
-
-// --- File ops tests ---
 
 func TestFilePutStart_CreatesOp(t *testing.T) {
 	r, _, store := testRelay(t)
@@ -816,35 +682,6 @@ func TestFileChmodRequest_MissingMode(t *testing.T) {
 	r.fileMu.RUnlock()
 	if count != 0 {
 		t.Errorf("file ops = %d, want 0 (missing mode)", count)
-	}
-}
-
-// --- Dir browse tests ---
-
-func TestDirListRequest_Success(t *testing.T) {
-	r, _, store := testRelay(t)
-	store.AddClient("node-1", nil)
-	dc := newMockDC("dash-1")
-
-	r.HandleDashboardEvent(dc, makeMsg("dir_list_request", map[string]any{
-		"clientId": "node-1", "path": "/home",
-	}))
-	// Should not panic
-}
-
-func TestDirListResponse_Broadcast(t *testing.T) {
-	r, md, _ := testRelay(t)
-
-	r.HandleAgentEvent("node-1", makeMsg("dir_list_response", map[string]any{
-		"requestId": "req-1", "path": "/home", "entries": []any{},
-	}))
-
-	msg := md.findBroadcast("dir_list_response")
-	if msg == nil {
-		t.Fatal("dir_list_response not broadcast")
-	}
-	if msg.Data["clientId"] != "node-1" {
-		t.Errorf("clientId = %v", msg.Data["clientId"])
 	}
 }
 
@@ -1486,7 +1323,7 @@ func TestDashboardEvent_NonAdminDeniedPrivilegedEvents(t *testing.T) {
 		"file_get_request", "file_put_start", "file_put_chunk", "file_put_finish",
 		"file_delete_request", "file_chmod_request", "file_mkdir_request",
 		"file_rename_request",
-		"backup_approve", "switch_variant", "kiosk_set", "kiosk_save_layout",
+		"switch_variant", "kiosk_set", "kiosk_save_layout",
 		"swarm_init_request", "swarm_join_request", "swarm_leave_request",
 	}
 
@@ -1516,7 +1353,7 @@ func TestDashboardEvent_NonAdminDeniedPrivilegedEvents(t *testing.T) {
 
 // Read-only events stay usable by a non-admin.
 func TestDashboardEvent_NonAdminAllowedReadOnlyEvents(t *testing.T) {
-	for _, event := range []string{"dir_list_request", "log_tail_start", "backup_plan_request"} {
+	for _, event := range []string{"log_tail_start", "log_tail_stop"} {
 		t.Run(event, func(t *testing.T) {
 			r, md, store := testRelay(t)
 			store.AddClient("node-1", nil)
@@ -1582,14 +1419,14 @@ func TestDashboardEvent_AuditsAtTheGate(t *testing.T) {
 		makeMsg("exec_request", map[string]any{"clientId": "node-1", "command": "id"}))
 	// Read-only traffic stays out of the trail.
 	r.HandleDashboardEvent(newMockNonAdminDC("dash-2"),
-		makeMsg("dir_list_request", map[string]any{"clientId": "node-1", "path": "/tmp"}))
+		makeMsg("log_tail_start", map[string]any{"clientId": "node-1", "path": "/tmp", "lines": 10}))
 
 	events, err := audit.Read(path, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	var allowed, denied, dirList int
+	var allowed, denied, readOnly int
 	for _, e := range events {
 		switch {
 		case e.Type == audit.TypePrivilegedEvent && e.Action == "shell_start":
@@ -1602,8 +1439,8 @@ func TestDashboardEvent_AuditsAtTheGate(t *testing.T) {
 			if e.Actor != "member-user" {
 				t.Errorf("denied record missing attribution: %+v", e)
 			}
-		case e.Action == "dir_list_request":
-			dirList++
+		case e.Action == "log_tail_start":
+			readOnly++
 		}
 	}
 	if allowed != 1 {
@@ -1612,8 +1449,8 @@ func TestDashboardEvent_AuditsAtTheGate(t *testing.T) {
 	if denied != 1 {
 		t.Errorf("denied privileged events recorded = %d, want 1", denied)
 	}
-	if dirList != 0 {
-		t.Errorf("read-only event was recorded %d time(s); want 0", dirList)
+	if readOnly != 0 {
+		t.Errorf("read-only event was recorded %d time(s); want 0", readOnly)
 	}
 	if res := audit.Verify(events); !res.Valid {
 		t.Errorf("audit chain invalid: %+v", res)

@@ -16,9 +16,9 @@ import (
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"nhooyr.io/websocket"
 
-	"github.com/austinkregel/backup-server/internal/auth"
-	"github.com/austinkregel/backup-server/internal/config"
-	"github.com/austinkregel/backup-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/auth"
+	"github.com/austinkregel/compute-agent-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/state"
 )
 
 // --- Mock OIDC provider for dashboard tests ---

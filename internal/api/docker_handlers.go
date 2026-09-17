@@ -7,7 +7,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/austinkregel/backup-server/internal/ws"
+	"github.com/austinkregel/compute-agent-server/internal/ws"
 )
 
 // These handlers expose read-only Docker/Swarm monitoring for connected agents.

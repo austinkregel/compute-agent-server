@@ -9,7 +9,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 
-	"github.com/austinkregel/backup-server/internal/ws"
+	"github.com/austinkregel/compute-agent-server/internal/ws"
 )
 
 // These handlers expose SMS history (read) and send (write) for phone-class

@@ -24,10 +24,6 @@ describe('computeClientTargetPath', () => {
     expect(computeClientTargetPath({ currentPath: '/client/abc/logs', nextClientId: 'xyz' })).toBe('/client/xyz/logs');
   });
 
-  it('preserves /backups subpage when switching clients', () => {
-    expect(computeClientTargetPath({ currentPath: '/client/old-client/backups', nextClientId: 'new-client' })).toBe('/client/new-client/backups');
-  });
-
   it('URL-encodes special characters in clientId', () => {
     expect(computeClientTargetPath({ currentPath: '/', nextClientId: 'client with spaces' })).toBe('/client/client%20with%20spaces');
     expect(computeClientTargetPath({ currentPath: '/', nextClientId: 'client/slash' })).toBe('/client/client%2Fslash');

@@ -6,18 +6,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/url"
-	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/google/uuid"
 
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/database"
-	"github.com/austinkregel/backup-server/internal/state"
-	"github.com/austinkregel/backup-server/internal/ws"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/database"
+	"github.com/austinkregel/compute-agent-server/internal/state"
+	"github.com/austinkregel/compute-agent-server/internal/ws"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 
@@ -26,42 +24,6 @@ const isoMillis = "2006-01-02T15:04:05.000Z"
 
 func nowISO() string {
 	return time.Now().UTC().Format(isoMillis)
-}
-
-// writePlanFile persists a backup plan JSON file to backupsDir.
-func (r *Relay) writePlanFile(planID string, data map[string]any) {
-	if r.backupsDir == "" {
-		return
-	}
-	b, err := json.MarshalIndent(data, "", "  ")
-	if err != nil {
-		r.log.Warn("failed to marshal backup plan", "planId", planID, "error", err)
-		return
-	}
-	p := filepath.Join(r.backupsDir, planID+".json")
-	if err := os.WriteFile(p, b, 0640); err != nil {
-		r.log.Warn("failed to write backup plan file", "planId", planID, "error", err)
-	}
-}
-
-// updatePlanFile merges updates into an existing backup plan JSON file.
-func (r *Relay) updatePlanFile(planID string, update map[string]any) {
-	if r.backupsDir == "" {
-		return
-	}
-	p := filepath.Join(r.backupsDir, planID+".json")
-	prev := map[string]any{}
-	if raw, err := os.ReadFile(p); err == nil {
-		json.Unmarshal(raw, &prev)
-	}
-	for k, v := range update {
-		prev[k] = v
-	}
-	b, err := json.MarshalIndent(prev, "", "  ")
-	if err != nil {
-		return
-	}
-	os.WriteFile(p, b, 0640)
 }
 
 // auditDetail extracts the fields recorded for a privileged event. It is an
@@ -101,8 +63,7 @@ type Relay struct {
 	// Nil disables recording.
 	audit *audit.Logger
 
-	dash       DashSender
-	backupsDir string
+	dash DashSender
 
 	// Shell sessions: sessionID → shellSession
 	shellMu       sync.RWMutex
@@ -111,10 +72,6 @@ type Relay struct {
 	// Log tail sessions: sessionID → logTailSession
 	logMu       sync.RWMutex
 	logSessions map[string]*logTailSession
-
-	// Backup jobs: planID → backupJob
-	backupMu   sync.RWMutex
-	backupJobs map[string]*backupJob
 
 	// Pending file ops: requestID → fileOp
 	fileMu  sync.RWMutex
@@ -150,17 +107,6 @@ type logTailSession struct {
 	DashConnID string
 	Lines      int
 	CreatedAt  time.Time
-}
-
-type backupJob struct {
-	ClientID       string
-	DashConnID     string
-	PlanID         string
-	Status         string // planning, planned, running, completed, failed
-	FilesCompleted int
-	Job            map[string]any
-	Plan           map[string]any
-	CreatedAt      time.Time
 }
 
 type fileOp struct {
@@ -232,7 +178,6 @@ func (r *Relay) ResolveGenericPending(token string, data map[string]any) bool {
 }
 
 // New creates a new Relay instance.
-// backupsDir is the directory for persisting backup plan JSON files (e.g., "backups").
 // SetAudit attaches the audit logger. Called during server wiring.
 func (r *Relay) SetAudit(a *audit.Logger) { r.audit = a }
 
@@ -252,18 +197,13 @@ func actorOf(dc *ws.DashboardConn) string {
 	return dc.User.Sub
 }
 
-func New(store *state.Store, log *logging.Logger, dash DashSender, backupsDir string) *Relay {
-	if backupsDir != "" {
-		os.MkdirAll(backupsDir, 0750)
-	}
+func New(store *state.Store, log *logging.Logger, dash DashSender) *Relay {
 	return &Relay{
 		store:          store,
 		log:            log,
 		dash:           dash,
-		backupsDir:     backupsDir,
 		shellSessions:  make(map[string]*shellSession),
 		logSessions:    make(map[string]*logTailSession),
-		backupJobs:     make(map[string]*backupJob),
 		fileOps:        make(map[string]*fileOp),
 		pendingResults: make(map[string]chan adminResult),
 		genericPending: make(map[string]chan map[string]any),
@@ -280,14 +220,9 @@ func New(store *state.Store, log *logging.Logger, dash DashSender, backupsDir st
 // managed machine. They deliver the same capabilities as /api/server/*, so
 // gating the REST API alone leaves that gate bypassable.
 var unprivilegedDashboardEvents = map[string]bool{
-	// Read-only inspection of an agent's filesystem and logs.
-	"dir_list_request": true,
-	"log_tail_start":   true,
-	"log_tail_stop":    true,
-
-	// Backup planning is a dry run; backup_approve (which executes it) is not
-	// listed and therefore requires admin.
-	"backup_plan_request": true,
+	// Read-only inspection of an agent's logs.
+	"log_tail_start": true,
+	"log_tail_stop":  true,
 
 	// Kiosk layout reads.
 	"kiosk_get_layouts": true,
@@ -381,12 +316,6 @@ func (r *Relay) HandleDashboardEvent(dc *ws.DashboardConn, msg *ws.Message) {
 	case "log_tail_stop":
 		r.handleLogTailStop(dc, data)
 
-	// Backup
-	case "backup_plan_request":
-		r.handleBackupPlanRequest(dc, data)
-	case "backup_approve":
-		r.handleBackupApprove(dc, data)
-
 	// File ops
 	case "file_get_request":
 		r.handleFileGetRequest(dc, data)
@@ -404,10 +333,6 @@ func (r *Relay) HandleDashboardEvent(dc *ws.DashboardConn, msg *ws.Message) {
 		r.handleFileMkdirRequest(dc, data)
 	case "file_rename_request":
 		r.handleFileRenameRequest(dc, data)
-
-	// Dir browse
-	case "dir_list_request":
-		r.handleDirListRequest(dc, data)
 
 	// Generic command exec
 	case "exec_request":
@@ -466,16 +391,6 @@ func (r *Relay) HandleAgentEvent(clientID string, msg *ws.Message) {
 	case "log_tail_closed":
 		r.handleLogTailClosed(clientID, data)
 
-	// Backup
-	case "backup_plan":
-		r.handleBackupPlan(clientID, data)
-	case "backup_progress":
-		r.handleBackupProgress(clientID, data)
-	case "backup_complete":
-		r.handleBackupComplete(clientID, data)
-	case "backup_error":
-		r.handleBackupError(clientID, data)
-
 	// File ops
 	case "file_get_chunk":
 		r.handleFileGetChunk(clientID, data)
@@ -491,10 +406,6 @@ func (r *Relay) HandleAgentEvent(clientID string, msg *ws.Message) {
 		r.handleFileMkdirResult(clientID, data)
 	case "file_rename_result":
 		r.handleFileRenameResult(clientID, data)
-
-	// Dir browse
-	case "dir_list_response":
-		r.handleDirListResponse(clientID, data)
 
 	// Generic command exec
 	case "exec_result":
@@ -937,169 +848,6 @@ func (r *Relay) handleLogTailClosed(clientID string, data map[string]any) {
 	})
 }
 
-// --- Backup handlers ---
-
-func (r *Relay) handleBackupPlanRequest(dc *ws.DashboardConn, data map[string]any) {
-	clientID := str(data, "clientId")
-	if clientID == "" {
-		r.dash.SendTo(dc.ID, "backup_error", map[string]any{"error": "clientId required"})
-		return
-	}
-	if !r.store.HasClient(clientID) {
-		r.dash.SendTo(dc.ID, "backup_error", map[string]any{"error": "client offline", "clientId": clientID})
-		return
-	}
-
-	planID := uuid.NewString()
-
-	r.backupMu.Lock()
-	r.backupJobs[planID] = &backupJob{
-		ClientID:   clientID,
-		DashConnID: dc.ID,
-		PlanID:     planID,
-		Status:     "planning",
-		Job:        data,
-		CreatedAt:  time.Now(),
-	}
-	r.backupMu.Unlock()
-
-	// Forward to agent with planID
-	payload := copyMap(data)
-	payload["planId"] = planID
-	delete(payload, "clientId")
-	r.sendAs(dc, clientID, "backup_plan", payload)
-
-	r.dash.SendTo(dc.ID, "backup_plan_dispatched", map[string]any{
-		"clientId": clientID,
-		"planId":   planID,
-	})
-}
-
-func (r *Relay) handleBackupApprove(dc *ws.DashboardConn, data map[string]any) {
-	planID := str(data, "planId")
-	r.backupMu.Lock()
-	job, ok := r.backupJobs[planID]
-	if ok {
-		job.Status = "running"
-	}
-	r.backupMu.Unlock()
-	if !ok {
-		r.dash.SendTo(dc.ID, "backup_error", map[string]any{"error": "unknown planId", "planId": planID})
-		return
-	}
-
-	payload := copyMap(job.Job)
-	payload["planId"] = planID
-	delete(payload, "clientId")
-	r.sendAs(dc, job.ClientID, "backup_start", payload)
-
-	r.dash.Broadcast("backup_started", map[string]any{
-		"clientId": job.ClientID,
-		"planId":   planID,
-	})
-}
-
-func (r *Relay) handleBackupPlan(clientID string, data map[string]any) {
-	planID := str(data, "planId")
-	r.backupMu.Lock()
-	job, ok := r.backupJobs[planID]
-	if ok {
-		job.Status = "planned"
-		job.Plan = data
-	}
-	r.backupMu.Unlock()
-	if !ok {
-		return
-	}
-
-	r.writePlanFile(planID, map[string]any{
-		"clientId": clientID,
-		"planId":   planID,
-		"job":      job.Job,
-		"plan":     data,
-		"status":   "planned",
-	})
-
-	r.dash.Broadcast("backup_plan", map[string]any{
-		"clientId": clientID,
-		"planId":   planID,
-		"job":      job.Job,
-		"plan":     data,
-	})
-}
-
-func (r *Relay) handleBackupProgress(clientID string, data map[string]any) {
-	planID := str(data, "planId")
-	r.backupMu.Lock()
-	job, ok := r.backupJobs[planID]
-	if ok {
-		job.FilesCompleted++
-	}
-	r.backupMu.Unlock()
-	if !ok {
-		return
-	}
-
-	file := str(data, "file")
-	op := str(data, "op")
-	if file != "" && op != "" {
-		r.updatePlanFile(planID, map[string]any{
-			"filesCompleted": job.FilesCompleted,
-			"lastFile":       map[string]any{"file": file, "op": op, "ts": nowISO()},
-		})
-	}
-
-	payload := mergeClientID(clientID, data)
-	payload["filesCompleted"] = job.FilesCompleted
-	r.dash.Broadcast("backup_progress", payload)
-}
-
-func (r *Relay) handleBackupComplete(clientID string, data map[string]any) {
-	planID := str(data, "planId")
-	r.backupMu.Lock()
-	job, ok := r.backupJobs[planID]
-	if ok {
-		if boolVal(data, "ok") {
-			job.Status = "completed"
-		} else {
-			job.Status = "failed"
-		}
-	}
-	r.backupMu.Unlock()
-	if !ok {
-		return
-	}
-
-	r.updatePlanFile(planID, map[string]any{
-		"status":           job.Status,
-		"completedAt":      nowISO(),
-		"durationMs":       data["ms"],
-		"transferredBytes": data["transferredBytes"],
-	})
-
-	r.dash.Broadcast("backup_complete", mergeClientID(clientID, data))
-}
-
-func (r *Relay) handleBackupError(clientID string, data map[string]any) {
-	planID := str(data, "planId")
-	r.backupMu.Lock()
-	job, ok := r.backupJobs[planID]
-	if ok {
-		job.Status = "failed"
-	}
-	r.backupMu.Unlock()
-
-	if planID != "" {
-		r.updatePlanFile(planID, map[string]any{
-			"status":   "failed",
-			"error":    data["error"],
-			"failedAt": nowISO(),
-		})
-	}
-
-	r.dash.Broadcast("backup_error", mergeClientID(clientID, data))
-}
-
 // --- File operation handlers ---
 
 func (r *Relay) handleFilePutStart(dc *ws.DashboardConn, data map[string]any) {
@@ -1487,49 +1235,6 @@ func (r *Relay) handleFileRenameResult(clientID string, data map[string]any) {
 		return
 	}
 	r.dash.SendTo(op.DashConnID, "file_rename_result", mergeClientID(clientID, data))
-}
-
-// --- Dir browse handlers ---
-
-func (r *Relay) handleDirListRequest(dc *ws.DashboardConn, data map[string]any) {
-	clientID := str(data, "clientId")
-	if clientID == "" {
-		r.dash.SendTo(dc.ID, "dir_list_response", map[string]any{"error": "clientId required", "entries": []any{}})
-		return
-	}
-	if !r.store.HasClient(clientID) {
-		r.dash.SendTo(dc.ID, "dir_list_response", map[string]any{"error": "client offline", "clientId": clientID, "entries": []any{}})
-		return
-	}
-
-	reqID := str(data, "requestId")
-	if reqID == "" {
-		reqID = uuid.NewString()
-	}
-
-	mode := str(data, "mode")
-	if mode == "" {
-		mode = "local"
-	}
-
-	payload := copyMap(data)
-	payload["requestId"] = reqID
-	payload["mode"] = mode
-	if data["port"] == nil {
-		payload["port"] = 22
-	}
-	r.sendAs(dc, clientID, "dir_list_request", payload)
-
-	r.dash.SendTo(dc.ID, "dir_list_dispatched", map[string]any{
-		"clientId":  clientID,
-		"requestId": reqID,
-		"path":      data["path"],
-		"mode":      mode,
-	})
-}
-
-func (r *Relay) handleDirListResponse(clientID string, data map[string]any) {
-	r.dash.Broadcast("dir_list_response", mergeClientID(clientID, data))
 }
 
 // --- Git handlers ---

@@ -22,8 +22,8 @@ import (
 	josejwt "github.com/go-jose/go-jose/v4/jwt"
 	"golang.org/x/oauth2"
 
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/config"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 

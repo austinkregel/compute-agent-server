@@ -12,25 +12,25 @@ import (
 	"github.com/go-chi/chi/v5"
 	"nhooyr.io/websocket"
 
-	"github.com/austinkregel/backup-server/internal/allowlist"
-	"github.com/austinkregel/backup-server/internal/api"
-	"github.com/austinkregel/backup-server/internal/audit"
-	"github.com/austinkregel/backup-server/internal/auth"
-	servercli "github.com/austinkregel/backup-server/internal/cli"
-	"github.com/austinkregel/backup-server/internal/config"
-	"github.com/austinkregel/backup-server/internal/database"
-	"github.com/austinkregel/backup-server/internal/heartbeat"
-	"github.com/austinkregel/backup-server/internal/relay"
-	"github.com/austinkregel/backup-server/internal/spa"
-	"github.com/austinkregel/backup-server/internal/state"
-	tlspkg "github.com/austinkregel/backup-server/internal/tls"
-	"github.com/austinkregel/backup-server/internal/traefikcert"
-	"github.com/austinkregel/backup-server/internal/traefikroute"
-	"github.com/austinkregel/backup-server/internal/ws"
+	"github.com/austinkregel/compute-agent-server/internal/allowlist"
+	"github.com/austinkregel/compute-agent-server/internal/api"
+	"github.com/austinkregel/compute-agent-server/internal/audit"
+	"github.com/austinkregel/compute-agent-server/internal/auth"
+	servercli "github.com/austinkregel/compute-agent-server/internal/cli"
+	"github.com/austinkregel/compute-agent-server/internal/config"
+	"github.com/austinkregel/compute-agent-server/internal/database"
+	"github.com/austinkregel/compute-agent-server/internal/heartbeat"
+	"github.com/austinkregel/compute-agent-server/internal/relay"
+	"github.com/austinkregel/compute-agent-server/internal/spa"
+	"github.com/austinkregel/compute-agent-server/internal/state"
+	tlspkg "github.com/austinkregel/compute-agent-server/internal/tls"
+	"github.com/austinkregel/compute-agent-server/internal/traefikcert"
+	"github.com/austinkregel/compute-agent-server/internal/traefikroute"
+	"github.com/austinkregel/compute-agent-server/internal/ws"
 	"github.com/austinkregel/compute-agent/pkg/logging"
 )
 
-// Server is the top-level coordinator for the backup server.
+// Server is the top-level coordinator for the Compute Agent control plane.
 type Server struct {
 	cfg   *config.Config
 	log   *logging.Logger
@@ -122,8 +122,8 @@ func New(ctx context.Context, cfg *config.Config, log *logging.Logger) (*Server,
 	s.dashboard.SetInsecureAllowUnauthenticated(s.oidc == nil && cfg.InsecureAllowUnauthenticated)
 	s.agents.SetAudit(auditLog)
 
-	// Relay (with backup plan persistence directory)
-	s.relayer = relay.New(store, log, s.dashboard, "backups")
+	// Relay
+	s.relayer = relay.New(store, log, s.dashboard)
 	s.relayer.SetAudit(auditLog)
 	if s.sms != nil {
 		s.relayer.SetSMSStore(s.sms)
