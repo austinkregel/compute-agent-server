@@ -5,6 +5,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"nhooyr.io/websocket"
 )
 
 func TestStore_AddRemoveClient(t *testing.T) {
@@ -632,5 +634,48 @@ func TestStore_SwarmClustersIsDeterministic(t *testing.T) {
 				t.Fatalf("iteration %d: member %d = %q, want %q", i, j, got, id)
 			}
 		}
+	}
+}
+
+// TestRemoveClientConn_OnlyRemovesItsOwnConnection covers the ownership rule
+// behind the reconnect race: cleanup keyed to one socket must be a no-op once
+// that socket has been superseded, or a stale handler takes the live agent off
+// the roster while its connection is still open.
+func TestRemoveClientConn_OnlyRemovesItsOwnConnection(t *testing.T) {
+	stale := &websocket.Conn{}
+	live := &websocket.Conn{}
+
+	s := New()
+	if superseded := s.AddClient("node-1", stale); superseded != nil {
+		t.Errorf("first AddClient superseded %v, want nil", superseded)
+	}
+
+	superseded := s.AddClient("node-1", live)
+	if superseded != stale {
+		t.Errorf("AddClient returned %v, want the stale connection to retire", superseded)
+	}
+
+	if s.RemoveClientConn("node-1", stale) {
+		t.Error("stale connection removed the live session")
+	}
+	if !s.HasClient("node-1") {
+		t.Fatal("live session dropped by the stale connection's cleanup")
+	}
+	entry := s.GetClient("node-1")
+	entry.Mu.Lock()
+	registered := entry.Conn
+	entry.Mu.Unlock()
+	if registered != live {
+		t.Error("registered connection is not the live one")
+	}
+
+	if !s.RemoveClientConn("node-1", live) {
+		t.Error("live connection failed to remove its own session")
+	}
+	if s.HasClient("node-1") {
+		t.Error("client still present after its own connection cleaned up")
+	}
+	if s.RemoveClientConn("node-1", live) {
+		t.Error("second removal reported a removal that did not happen")
 	}
 }

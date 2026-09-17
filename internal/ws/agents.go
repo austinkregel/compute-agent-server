@@ -26,6 +26,10 @@ type AgentHandler struct {
 	// audit records agent handshake outcomes. Nil disables recording.
 	audit *audit.Logger
 
+	// readTimeout bounds how long a connection may deliver nothing at all
+	// before it is treated as dead. Zero disables the deadline.
+	readTimeout time.Duration
+
 	// OnConnect is called after an agent successfully connects and authenticates.
 	// Receives the client ID. Used to broadcast client_list to dashboards.
 	OnConnect func(clientID string)
@@ -53,6 +57,10 @@ func NewAgentHandler(store *state.Store, log *logging.Logger, authToken string, 
 
 // SetAudit attaches the audit logger. Called during server wiring.
 func (h *AgentHandler) SetAudit(a *audit.Logger) { h.audit = a }
+
+// SetReadTimeout bounds how long an agent connection may stay completely
+// silent before the server closes it. Zero (the default) disables it.
+func (h *AgentHandler) SetReadTimeout(d time.Duration) { h.readTimeout = d }
 
 // ServeHTTP upgrades the HTTP connection to WebSocket for agents.
 func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -122,8 +130,15 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	sessionKey := cmdsig.DeriveSessionKey(h.authToken, nonce)
 	signer := cmdsig.NewSigner(sessionKey)
 
-	// Register client in state
-	h.store.AddClient(clientID, conn)
+	// Register client in state. A reconnect while the previous socket is still
+	// open (the usual case after a power-cut, which never closes the old TCP
+	// connection) supersedes it; close it here so its handler unwinds instead
+	// of sitting in Read until the kernel gives up on a connection that is
+	// already replaced.
+	if superseded := h.store.AddClient(clientID, conn); superseded != nil {
+		h.log.Warn("agent reconnected over a still-open socket; retiring the old one", "clientId", clientID)
+		superseded.Close(websocket.StatusGoingAway, "superseded by a newer connection")
+	}
 	entry := h.store.GetClient(clientID)
 	if entry != nil {
 		entry.Mu.Lock()
@@ -143,7 +158,7 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := conn.Write(ackCtx, websocket.MessageText, helloAck); err != nil {
 		h.log.Error("failed to send hello_ack", "clientId", clientID, "error", err)
 		conn.Close(websocket.StatusInternalError, "hello_ack failed")
-		h.store.RemoveClient(clientID)
+		h.store.RemoveClientConn(clientID, conn)
 		return
 	}
 
@@ -154,8 +169,15 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Start read loop
 	h.readLoop(r.Context(), clientID, conn)
 
-	// Cleanup on disconnect
-	h.store.RemoveClient(clientID)
+	// Cleanup on disconnect, scoped to this socket. If the agent reconnected
+	// while this handler was still parked in Read, the entry now belongs to the
+	// newer connection and is not ours to remove — dropping it would take a
+	// live agent off the roster with its socket still open, which nothing
+	// recovers from because the agent has no reason to reconnect.
+	if !h.store.RemoveClientConn(clientID, conn) {
+		h.log.Info("retired agent socket closed; live session kept", "clientId", clientID)
+		return
+	}
 	h.log.Info("agent disconnected", "clientId", clientID)
 	if h.OnDisconnect != nil {
 		h.OnDisconnect(clientID)
@@ -165,8 +187,30 @@ func (h *AgentHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // readLoop reads messages from the agent WebSocket until the connection closes.
 func (h *AgentHandler) readLoop(ctx context.Context, clientID string, conn *websocket.Conn) {
 	for {
-		_, raw, err := conn.Read(ctx)
+		readCtx, cancel := ctx, context.CancelFunc(nil)
+		// A half-open connection (agent powered off mid-session) delivers
+		// neither data nor an error, so an unbounded Read parks this handler
+		// until the kernel eventually gives up. A healthy agent is well inside
+		// this window: it answers a ping every PingIntervalSec and reports
+		// stats every minute.
+		if h.readTimeout > 0 {
+			readCtx, cancel = context.WithTimeout(ctx, h.readTimeout)
+		}
+		_, raw, err := conn.Read(readCtx)
+		// Sampled before cancel(), which would otherwise mask the deadline.
+		timedOut := readCtx.Err() == context.DeadlineExceeded && ctx.Err() == nil
+		if cancel != nil {
+			cancel()
+		}
 		if err != nil {
+			// Read deadline, not a peer error: the socket is silent past the
+			// liveness window, so drop it rather than hold it open.
+			if timedOut {
+				h.log.Warn("agent socket silent past read timeout; closing",
+					"clientId", clientID, "timeout", h.readTimeout)
+				conn.Close(websocket.StatusGoingAway, "read timeout")
+				return
+			}
 			// Normal closure or context cancellation — not an error
 			if websocket.CloseStatus(err) != -1 || ctx.Err() != nil {
 				return

@@ -136,6 +136,12 @@ func New(ctx context.Context, cfg *config.Config, log *logging.Logger) (*Server,
 		ws.SendSignedCommand(store, clientID, "exec_allowlist",
 			map[string]any{"commands": s.allowlist.Commands()}, log)
 	}
+	// Backstop for a half-open socket: an agent that vanishes without closing
+	// its connection (power-cut, dead link) otherwise leaves its handler parked
+	// in Read. Generous relative to the heartbeat — a live agent answers a ping
+	// every PingIntervalSec, so silence for three pong timeouts means gone.
+	s.agents.SetReadTimeout(time.Duration(s.cfg.PongTimeoutSec*3) * time.Second)
+
 	s.agents.OnDisconnect = func(clientID string) {
 		s.dashboard.BroadcastClientList()
 	}

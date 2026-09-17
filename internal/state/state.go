@@ -197,19 +197,64 @@ func New() *Store {
 
 // --- Client management ---
 
-// AddClient registers a new agent connection.
-func (s *Store) AddClient(clientID string, conn *websocket.Conn) {
+// AddClient registers a new agent connection and returns the connection it
+// superseded, or nil when there was none.
+//
+// A hard power-cut never closes the agent's socket, so the same agent can
+// reconnect while the previous handler is still parked in Read on a half-open
+// connection. The caller closes the returned conn to retire that handler;
+// ownership is tracked by connection identity (see RemoveClientConn) so the
+// retiring handler cannot evict this new session on its way out.
+func (s *Store) AddClient(clientID string, conn *websocket.Conn) *websocket.Conn {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	// It is back; drop the offline snapshot so the roster does not list the
 	// same agent twice.
 	delete(s.lastSeen, clientID)
+	var superseded *websocket.Conn
+	if prev, ok := s.clients[clientID]; ok {
+		prev.Mu.Lock()
+		superseded = prev.Conn
+		prev.Mu.Unlock()
+	}
 	s.clients[clientID] = &ClientEntry{
 		ClientID:      clientID,
 		Conn:          conn,
 		LastPong:      time.Now(),
 		Authenticated: true,
 	}
+	if superseded == conn {
+		return nil
+	}
+	return superseded
+}
+
+// RemoveClientConn drops the client only if conn is the connection currently
+// registered for it, reporting whether it removed anything. Disconnect paths
+// that belong to one specific socket must use this rather than RemoveClient: a
+// stale handler unwinding after its connection was superseded would otherwise
+// delete the live session, leaving the agent connected to a server that has
+// forgotten it — and with no dropped socket, nothing tells it to reconnect.
+//
+// A nil conn matches any registered connection, for entries created without one.
+func (s *Store) RemoveClientConn(clientID string, conn *websocket.Conn) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	e, ok := s.clients[clientID]
+	if !ok {
+		return false
+	}
+	if conn != nil {
+		e.Mu.Lock()
+		current := e.Conn
+		e.Mu.Unlock()
+		if current != nil && current != conn {
+			return false
+		}
+	}
+	s.removeClientLocked(clientID)
+	return true
 }
 
 // RemoveClient marks an agent disconnected. The live entry is dropped so every
@@ -220,7 +265,11 @@ func (s *Store) AddClient(clientID string, conn *websocket.Conn) {
 func (s *Store) RemoveClient(clientID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	s.removeClientLocked(clientID)
+}
 
+// removeClientLocked is the body of RemoveClient. Caller holds s.mu.
+func (s *Store) removeClientLocked(clientID string) {
 	if e, ok := s.clients[clientID]; ok {
 		e.Mu.Lock()
 		pub := publicClientLocked(e)

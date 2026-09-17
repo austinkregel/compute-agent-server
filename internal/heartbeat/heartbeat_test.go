@@ -54,6 +54,15 @@ func (s *mockStore) EvictClient(clientID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.evicted = append(s.evicted, clientID)
+	// Drop the client, as the real store does: callbacks that look the client
+	// up must see the same before/after the eviction that production does.
+	kept := s.clients[:0]
+	for _, c := range s.clients {
+		if c.id != clientID {
+			kept = append(kept, c)
+		}
+	}
+	s.clients = kept
 }
 
 func TestTicker_PingsActiveClients(t *testing.T) {
@@ -245,5 +254,56 @@ func TestTicker_OnEvict_Callback(t *testing.T) {
 
 	if called != "bye-1" {
 		t.Errorf("expected OnEvict callback with 'bye-1', got %q", called)
+	}
+}
+
+// containsClient reports whether the store still holds clientID.
+func (s *mockStore) containsClient(clientID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, c := range s.clients {
+		if c.id == clientID {
+			return true
+		}
+	}
+	return false
+}
+
+// TestTicker_OnEvictRunsBeforeDrop pins the ordering that lets OnEvict close the
+// timed-out agent's socket. The callback finds the connection by looking the
+// client up in the store, so dropping the entry first leaves the lookup empty
+// and the socket open — and an agent whose socket stays open never learns it
+// was evicted, so it never reconnects and stays unreachable until its process
+// restarts.
+func TestTicker_OnEvictRunsBeforeDrop(t *testing.T) {
+	client := &mockClient{
+		id:       "stale-1",
+		lastPong: time.Now().Add(-10 * time.Second),
+	}
+	store := &mockStore{clients: []*mockClient{client}}
+
+	visible := make(chan bool, 1)
+	tk := New(store, Config{
+		PingInterval: 20 * time.Millisecond,
+		PongTimeout:  100 * time.Millisecond,
+		OnEvict: func(clientID string) {
+			select {
+			case visible <- store.containsClient(clientID):
+			default:
+			}
+		},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tk.Start(ctx)
+
+	select {
+	case found := <-visible:
+		if !found {
+			t.Error("OnEvict ran after the client was dropped; it cannot find the socket to close")
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("OnEvict was never called for a timed-out client")
 	}
 }
